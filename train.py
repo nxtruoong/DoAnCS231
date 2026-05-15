@@ -164,8 +164,8 @@ def main() -> None:
     ap.add_argument("--weight-decay", type=float, default=5e-4)
     ap.add_argument("--label-smoothing", type=float, default=0.1)
     ap.add_argument("--ema-decay", type=float, default=0.999)
-    ap.add_argument("--cutmix-alpha", type=float, default=1.0)
-    ap.add_argument("--cutmix-p", type=float, default=0.5)
+    ap.add_argument("--cutmix-alpha", type=float, default=0.5)
+    ap.add_argument("--cutmix-p", type=float, default=0.3)
     ap.add_argument("--no-cutmix", action="store_true")
     ap.add_argument("--no-grayscale", action="store_true",
                     help="Tier-1 fallback: drop RandomGrayscale from train aug.")

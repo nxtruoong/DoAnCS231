@@ -32,12 +32,12 @@ def load_stats(stats_path: Path) -> tuple[list[float], list[float]]:
 def build_train_transform(mean: list[float], std: list[float], size: int = 224) -> transforms.Compose:
     return transforms.Compose([
         transforms.RandomResizedCrop(size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
-        transforms.ColorJitter(brightness=0.5, contrast=0.4, saturation=0.4, hue=0.2),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5)),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        transforms.RandomGrayscale(p=0.1),
+        transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 0.8)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
-        transforms.RandomErasing(p=0.3, scale=(0.02, 0.20), ratio=(0.3, 3.3), value="random"),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.10), ratio=(0.3, 3.3), value="random"),
     ])
 
 
