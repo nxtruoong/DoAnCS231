@@ -160,36 +160,53 @@ next notebook session.
 
 ---
 
-## 5. Notebook 02 — Full Train (~2.5-3 hr)
+## 5. Notebook 02 — Full Train (~1.5 hr, early stop)
 
-**Purpose:** train ResNet-18 + CBAM for 40 epochs.
+**Purpose:** Run 5 canonical config — ResNet-18 + CBAM, TrivialAugment,
+320x320 input, max 80 epochs with early stopping.
 
 ```python
 # Cell 1: paths (copy section 3)
-# Cell 2: full training run
+# Cell 2: Run 5 training command
 !cd {CODE_DIR} && python train.py \
     --data-root  {COMP_DIR} \
     --splits-dir {WORK}/splits \
-    --out-dir    {WORK}/run1 \
-    --epochs 40 --batch-size 128 --num-workers 4 \
-    --lr 0.1 --momentum 0.9 --weight-decay 5e-4 \
-    --label-smoothing 0.1 --ema-decay 0.999 \
-    --cutmix-alpha 1.0 --cutmix-p 0.5 \
+    --out-dir    {WORK}/run5 \
+    --epochs 80 --batch-size 128 --num-workers 4 \
+    --lr 0.03 --warmup-epochs 2 \
+    --momentum 0.9 --weight-decay 5e-4 \
+    --label-smoothing 0.1 --ema-decay 0.99 \
+    --cutmix-alpha 0.5 --cutmix-p 0.3 \
+    --img-size 320 --trivialaugment \
+    --early-stop-patience 8 --early-stop-min-delta 0.005 \
     --ckpt-every 5 \
     --data-parallel
 ```
 
 **Monitoring:**
-- Each epoch prints `train acc | val acc | ema val acc | elapsed`.
-- Per-epoch time on T4 x2 with batch 128: ~3.5-4.5 min. Full run:
-  ~2.5-3 hr.
-- Checkpoints land in `/kaggle/working/run1/`:
+- Each epoch prints `train loss | train acc | val loss | val acc | ema val acc | elapsed`.
+- Per-epoch time on T4 x2 with batch 128, img 320: ~2.2 min.
+- Run 5 stopped at ep 38/80 via early stop (8 epochs no gain >= 0.005
+  over best `max(val_acc, ema_val_acc) = 0.8431`). Total: ~83 min.
+- Checkpoints land in `/kaggle/working/run5/`:
   `best.pt`, `ckpt_e05.pt`, `ckpt_e10.pt`, ..., `final.pt`.
 
-**Tier-1 fallback (built-in):** at epoch 20, if EMA val acc < 0.50, the
-script aborts and prints a hint. Restart cell 2 with:
+**Expected milestones (from Run 5 log):**
+
+| epoch | val acc | ema val acc |
+|------:|--------:|------------:|
+| 7  | 0.63 | 0.69 |
+| 14 | 0.76 | 0.82 |
+| 20 | 0.80 | 0.82 |
+| 30 | 0.79 | **0.84** ← best EMA |
+| 31 | **0.83** ← best raw | 0.80 |
+| 38 | 0.77 | 0.81 (early stop) |
+
+**Tier-1 fallback (built-in):** at epoch 20, if `max(val_acc, ema_val_acc) < 0.50`,
+script aborts and prints a hint. Run 5 hit 0.82 by ep 20 — fallback
+did not trigger. If it does, restart cell 2 with:
 ```
---no-cutmix --no-grayscale --out-dir {WORK}/run1_fallback
+--no-cutmix --no-grayscale --out-dir {WORK}/run5_fallback
 ```
 
 **Kaggle session limits:**
@@ -205,32 +222,38 @@ After training, verify:
 ```python
 # Cell 3: peek at history
 import json
-hist = json.loads(open(f"{WORK}/run1/history.json").read())
+hist = json.loads(open(f"{WORK}/run5/history.json").read())
 print(f"Final epoch: {hist[-1]}")
 print(f"Best EMA val acc seen: {max(h['ema_val_acc'] for h in hist):.4f}")
+# Expected: best EMA ~0.84 (Run 5 reference)
 ```
 
 **Tier-2 fallback (manual):** if final EMA val acc < 0.55, also run
-notebook 03 with `--no-cbam` and present both — the ablation table
-becomes the headline result.
+notebook 03 with `--no-cbam` and present both — ablation table
+becomes headline result.
 
-Commit the notebook so `run1/` persists.
+Commit notebook so `run5/` persists.
 
 ---
 
-## 6. Notebook 03 — Ablation (no CBAM, ~1.5 hr)
+## 6. Notebook 03 — Ablation (no CBAM, ~1 hr)
 
-**Purpose:** baseline ResNet-18 without CBAM to populate the ablation
-table.
+**Purpose:** baseline ResNet-18 without CBAM, same Run 5 schedule
+otherwise. Populates ablation table.
 
 ```python
 # Cell 1: paths (copy section 3)
-# Cell 2: baseline run, fewer epochs
+# Cell 2: baseline run — Run 5 config minus CBAM
 !cd {CODE_DIR} && python train.py \
     --data-root  {COMP_DIR} \
     --splits-dir {WORK}/splits \
     --out-dir    {WORK}/run_baseline \
-    --epochs 25 --batch-size 128 --num-workers 4 \
+    --epochs 80 --batch-size 128 --num-workers 4 \
+    --lr 0.03 --warmup-epochs 2 \
+    --label-smoothing 0.1 --ema-decay 0.99 \
+    --cutmix-alpha 0.5 --cutmix-p 0.3 \
+    --img-size 320 --trivialaugment \
+    --early-stop-patience 8 --early-stop-min-delta 0.005 \
     --no-cbam \
     --data-parallel
 ```
@@ -248,13 +271,14 @@ failure overlays. Plus the ablation comparison table.
 ```python
 # Cell 1: paths (copy section 3)
 
-# Cell 2: eval main model
+# Cell 2: eval main model (img-size must match training: 320)
 !cd {CODE_DIR} && python eval.py \
-    --ckpt        {WORK}/run1/best.pt \
+    --ckpt        {WORK}/run5/best.pt \
     --data-root   {COMP_DIR} \
     --splits-dir  {WORK}/splits \
-    --out-dir     {WORK}/run1/eval \
-    --history-json {WORK}/run1/history.json
+    --out-dir     {WORK}/run5/eval \
+    --history-json {WORK}/run5/history.json \
+    --img-size 320
 
 # Cell 3: eval baseline
 !cd {CODE_DIR} && python eval.py \
@@ -262,7 +286,8 @@ failure overlays. Plus the ablation comparison table.
     --data-root   {COMP_DIR} \
     --splits-dir  {WORK}/splits \
     --out-dir     {WORK}/run_baseline/eval \
-    --history-json {WORK}/run_baseline/history.json
+    --history-json {WORK}/run_baseline/history.json \
+    --img-size 320
 
 # Cell 4: ablation table
 import json, pandas as pd
@@ -272,7 +297,7 @@ def metrics(p):
             "macro_f1":    m["macro avg"]["f1-score"],
             "weighted_f1": m["weighted avg"]["f1-score"]}
 table = pd.DataFrame({
-    "ResNet-18 + CBAM (full)": metrics(f"{WORK}/run1/eval/metrics.json"),
+    "ResNet-18 + CBAM (full)": metrics(f"{WORK}/run5/eval/metrics.json"),
     "ResNet-18 baseline":      metrics(f"{WORK}/run_baseline/eval/metrics.json"),
 }).T
 print(table.to_string())
@@ -280,9 +305,9 @@ table.to_csv(f"{WORK}/ablation_table.csv")
 
 # Cell 5: bundle all artifacts for download
 !cd {WORK} && zip -r artifacts.zip \
-    run1/eval run_baseline/eval \
-    run1/history.json run_baseline/history.json \
-    run1/best.pt run_baseline/best.pt \
+    run5/eval run_baseline/eval \
+    run5/history.json run_baseline/history.json \
+    run5/best.pt run_baseline/best.pt \
     splits/stats.json splits/train.csv splits/val.csv \
     ablation_table.csv
 print("Size:", __import__("os").path.getsize(f"{WORK}/artifacts.zip") / 1e6, "MB")
@@ -304,7 +329,7 @@ Expand-Archive -Path artifacts.zip -DestinationPath .
 
 You should now have:
 ```
-run1/eval/
+run5/eval/
     classification_report.txt
     metrics.json
     confusion_matrix.png
@@ -313,7 +338,7 @@ run1/eval/
     training_curves.png
     attention_grid.png
     failures.png
-run1/best.pt
+run5/best.pt
 run_baseline/eval/...
 splits/stats.json
 ablation_table.csv
@@ -340,8 +365,11 @@ These feed directly into the report.
 
 ```powershell
 pip install -r requirements.txt
-python app.py --ckpt run1/best.pt --stats splits/stats.json --examples-dir examples
+python app.py --ckpt run5/best.pt --stats splits/stats.json --examples-dir examples
 ```
+
+Caveat: `app.py` hardcodes 224x224 preprocessing — mismatches Run 5
+training at 320. Demo accuracy will lag eval metrics until aligned.
 
 Gradio prints `http://127.0.0.1:7860` — open in browser. Test:
 - Upload one dataset image → high-confidence correct class.
@@ -358,7 +386,7 @@ For a public link (e.g. to share with the teacher): add `--share`.
 2. **New Space** → SDK: Gradio, hardware: CPU basic (free).
 3. In the Space repo, upload:
    - `app.py`, `model.py`, `augment.py`, `eval.py`, `requirements.txt`
-   - `run1/best.pt` (rename `checkpoints/best.pt`, ≤ 50 MB, OK)
+   - `run5/best.pt` (rename `checkpoints/best.pt`, ≤ 50 MB, OK)
    - `splits/stats.json` (rename `splits/stats.json`)
    - `examples/`
 4. In the Space's **Settings → Variables**, add (optional, since the
@@ -376,14 +404,14 @@ For a public link (e.g. to share with the teacher): add `--share`.
 
 ## 12. Final deliverables checklist
 
-- [ ] `run1/eval/classification_report.txt` (sklearn output: precision,
+- [ ] `run5/eval/classification_report.txt` (sklearn output: precision,
       recall, f1-score, support per class + accuracy + macro avg +
       weighted avg)
-- [ ] `run1/eval/confusion_matrix.png`
-- [ ] `run1/eval/per_driver_accuracy.{png,csv}`
-- [ ] `run1/eval/training_curves.png`
-- [ ] `run1/eval/attention_grid.png`
-- [ ] `run1/eval/failures.png`
+- [ ] `run5/eval/confusion_matrix.png`
+- [ ] `run5/eval/per_driver_accuracy.{png,csv}`
+- [ ] `run5/eval/training_curves.png`
+- [ ] `run5/eval/attention_grid.png`
+- [ ] `run5/eval/failures.png`
 - [ ] `ablation_table.csv` + `run_baseline/eval/*`
 - [ ] `examples/` with 10 OOD images
 - [ ] HuggingFace Spaces URL (or screen recording of local demo)
@@ -409,15 +437,15 @@ For a public link (e.g. to share with the teacher): add `--share`.
 
 ---
 
-## 14. Time budget summary
+## 14. Time budget summary (Run 5 actuals)
 
 | Stage | Wall time | GPU time |
 |---|---|---|
 | 01 stats + split + sanity train | ~10-15 min | ~5 min |
-| 02 full train | ~2.5-3 hr | ~2.5-3 hr |
-| 03 ablation | ~1.5 hr | ~1.5 hr |
+| 02 full train (Run 5, early stop ep 38) | ~1.5 hr | ~1.5 hr |
+| 03 ablation (no CBAM, same schedule) | ~1 hr | ~1 hr |
 | 04 eval + figures | ~10-15 min | ~5 min |
 | OOD image curation + local demo | ~1 hr | 0 |
 | HF Space deploy | ~30 min | 0 |
-| Report + slides | a separate evening | 0 |
-| **GPU total** | | **~4.5-5 hr** ✓ within 5 hr budget |
+| Report + slides | separate evening | 0 |
+| **GPU total** | | **~3 hr** ✓ well within 5 hr budget |

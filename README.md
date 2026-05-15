@@ -15,16 +15,18 @@ See [`CONTEXT.md`](CONTEXT.md) for the full glossary and decisions, and
 | | |
 |---|---|
 | Architecture | ResNet-18 + CBAM (CAM + SAM) after each of layer1..4 |
-| Init | Kaiming, no pretrain |
+| Init | Kaiming (conv), `N(0, 0.01)` (final fc), no pretrain |
 | Split | Subject-wise; held-out: `p022, p035, p047, p056, p075` |
-| Augmentation | RandomResizedCrop, ColorJitter, RandomGrayscale, GaussianBlur, RandomErasing, CutMix. **No HFlip** (left/right class asymmetry — see ADR 0002) |
+| Augmentation | RandomResizedCrop + **TrivialAugmentWide** + Normalize + RandomErasing(p=0.25). CutMix(p=0.3, alpha=0.5) at batch level. **No HFlip** (left/right class asymmetry — see ADR 0002) |
 | Optimizer | SGD (Nesterov), momentum=0.9, weight_decay=5e-4 |
-| LR schedule | Cosine 0.1 -> 0 over 40 epochs |
+| LR schedule | Linear warmup (2 ep) → Cosine 0.03 → 0 |
 | Loss | CrossEntropy with label smoothing 0.1 |
-| EMA decay | 0.999 (eval on EMA weights) |
+| EMA decay | 0.99 (eval on EMA weights; BN buffers copied verbatim) |
 | Normalization | Dataset-computed RGB stats |
-| Batch / size | 128 / 224x224 |
-| Target time | < 5 hr on Kaggle T4x2 |
+| Batch / size | 128 / 320x320 |
+| Max epochs / early stop | 80 / patience 8 on `max(val_acc, ema_val_acc)`, min-delta 0.005 |
+| Target time | < 5 hr on Kaggle T4x2 (Run 5: ~83 min, stopped ep 38) |
+| Run 5 result | best raw val acc **0.8327** (ep 31), best EMA val acc **0.8431** (ep 30) |
 
 ## Repo layout
 
@@ -49,27 +51,43 @@ See [`CONTEXT.md`](CONTEXT.md) for the full glossary and decisions, and
    Detection** dataset, set Accelerator = GPU T4 x2, Internet = On.
 2. Upload this repo as a Kaggle dataset (or `!git clone` from your own
    GitHub) so the scripts are importable.
-3. Run the four notebooks in [`notebooks/`](notebooks/) in order:
+3. Run cell recipes in [`notebooks/README.md`](notebooks/README.md) in order:
    - `01_stats_split` — verify split + compute dataset RGB stats (~5 min)
-   - `02_train` — full 40-epoch training run (~2.5-3 hr)
+   - `02_train` — full Run 5 schedule, max 80 ep, early stop ~ep 38 (~1.5 hr)
    - `03_ablation` — baseline without CBAM, 25 epochs (~1.5 hr)
    - `04_eval_figs` — generate classification_report + all figures
 
+Run 5 canonical training command:
+
+```bash
+python train.py \
+    --data-root /kaggle/input/competitions/state-farm-distracted-driver-detection \
+    --splits-dir /kaggle/working/splits \
+    --out-dir    /kaggle/working/run5 \
+    --epochs 80 --batch-size 128 --num-workers 4 \
+    --lr 0.03 --warmup-epochs 2 --ema-decay 0.99 \
+    --img-size 320 --trivialaugment \
+    --early-stop-patience 8 --early-stop-min-delta 0.005 \
+    --data-parallel
+```
+
 ## Tier-1 fallback (built-in)
 
-`train.py` auto-checks val accuracy at epoch 20. If EMA val acc < 0.50,
-the run aborts. Restart with:
+`train.py` auto-checks val accuracy at epoch 20. If `max(val_acc, ema_val_acc) < 0.50`,
+run aborts. Restart with:
 
 ```bash
 python train.py ... --no-cutmix --no-grayscale
 ```
 
+Run 5 hit ema val acc 0.82 by ep 20 — fallback not triggered.
+
 ## Tier-2 fallback (manual)
 
-If final EMA val acc < 0.55, retrain without CBAM as a baseline:
+If final EMA val acc < 0.55, retrain without CBAM as baseline:
 
 ```bash
-python train.py ... --no-cbam --no-cutmix --out-dir run_baseline
+python train.py ... --no-cbam --out-dir run_baseline
 ```
 
 ## Demo (local)
@@ -77,6 +95,9 @@ python train.py ... --no-cbam --no-cutmix --out-dir run_baseline
 ```bash
 python app.py --ckpt checkpoints/best.pt --stats splits/stats.json
 ```
+
+Note: `app.py` currently hardcodes 224x224 input — mismatches Run 5
+training at 320x320. Demo accuracy will lag eval metrics until aligned.
 
 For HuggingFace Spaces deployment: set `CKPT_PATH`, `STATS_PATH`,
 `EXAMPLES_DIR` env vars; the Space runs `python app.py`.

@@ -144,17 +144,18 @@ class ResNet18CBAM(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def features(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward to pre-fc 512-d feature vector. Used by two-stream wrapper."""
         x = F.relu(self.bn1(self.conv1(x)), inplace=True)
         x = self.maxpool(x)
-
         x = self.cbam1(self.layer1(x))
         x = self.cbam2(self.layer2(x))
         x = self.cbam3(self.layer3(x))
         x = self.cbam4(self.layer4(x))
+        return self.avgpool(x).flatten(1)
 
-        x = self.avgpool(x).flatten(1)
-        return self.fc(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.features(x))
 
     def last_spatial_attention(self) -> torch.Tensor | None:
         """SAM map from the last CBAM block (layer4), shape (B, 1, 7, 7)
