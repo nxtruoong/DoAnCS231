@@ -171,6 +171,9 @@ def main() -> None:
                     help="Tier-1 fallback: drop RandomGrayscale from train aug.")
     ap.add_argument("--no-cbam", action="store_true",
                     help="Ablation baseline: ResNet-18 without CBAM blocks.")
+    ap.add_argument("--minimal-aug", action="store_true",
+                    help="Smoke test: strip ColorJitter/Grayscale/Blur/Erasing; "
+                    "keep only RandomResizedCrop + Normalize.")
     ap.add_argument("--ckpt-every", type=int, default=5)
     ap.add_argument("--warmup-epochs", type=int, default=5)
     ap.add_argument("--tier1-epoch", type=int, default=20)
@@ -184,12 +187,18 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     mean, std = load_stats(args.splits_dir / "stats.json")
-    train_tx = build_train_transform(mean, std)
-    if args.no_grayscale:
-        # Strip RandomGrayscale (index varies — find by class)
-        from torchvision import transforms
-        train_tx.transforms = [t for t in train_tx.transforms
-                               if not isinstance(t, transforms.RandomGrayscale)]
+    from torchvision import transforms
+    if args.minimal_aug:
+        train_tx = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+    else:
+        train_tx = build_train_transform(mean, std)
+        if args.no_grayscale:
+            train_tx.transforms = [t for t in train_tx.transforms
+                                   if not isinstance(t, transforms.RandomGrayscale)]
     eval_tx = build_eval_transform(mean, std)
 
     img_root = args.data_root / "imgs" / "train"
