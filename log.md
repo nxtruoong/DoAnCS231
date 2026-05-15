@@ -192,12 +192,26 @@ Recommend **B** for accuracy ceiling, **A** for diagnosing EMA contribution clea
    - TrivialAugmentWide + RandomErasing → some augmented inputs genuinely hard.
 5. **Early stop fired correctly at ep 38.** Saved ~42 epochs × ~2.2 min = ~92 min of GPU time vs full 80.
 
-**Visual inspection finding (post-run, before eval):** RandomResizedCrop `scale=(0.7, 1.0)` was too aggressive — crop randomly removes up to 30% area. State Farm cabin has the **radio on driver's right edge** (left side of frame). Class c5 (operating radio) likely under-trained because radio frequently cropped out of training samples. Eval transform also center-crops `366→320` at `--img-size 320`, losing ~84 px each side of longer dim — same problem at inference.
+**Per-class findings (after eval on Run 5 weights):**
 
-**Decision:** before re-running, fix both transforms (commit `954218a` — see Run 6 below).
+1. **c5 (operating radio) — under-trained because of crop.** RandomResizedCrop `scale=(0.7, 1.0)` removes up to 30% area; the radio sits on the driver's right edge (left side of frame), so it is the first thing cropped out. Eval transform also center-crops `366→320` at `--img-size 320`, losing ~84 px each side of longer dim → radio chopped off at inference too. Re-eval with the new no-crop eval transform (commit `954218a`) bumped c5 acc significantly without retraining — confirms eval cropping was a big chunk of the c5 problem.
+2. **c8 (hair / makeup) — confused with c2 (phone-right), ~66% acc.** Both classes have **right hand near the right side of the face**. Without a strong "phone object" cue, model collapses both into one "hand-to-head" pattern. CutMix amplifies this: at p=0.3 a c8 image often gets a rectangle from a c2 image (phone visible) pasted into the face/hand region, training the model to treat hand-to-head as an ambiguous label.
+3. **c3 (texting-left) — ~77% acc, hard by camera geometry.** Camera mounted on driver's right side → left hand is on the **far side of the cabin**, partially occluded by the body, and the phone object is foreshortened (~10-20 px at 320 input). Likely confusions: c4 (phone-left, same hand region) and c0 (safe driving if hand drops low). c1↔c3 should be near-zero given no-HFlip aug — verify in confusion matrix.
+
+**Fixes applied (commits `954218a` aug, see Run 6 below for cutmix/resolution):**
+- Train: `RandomResizedCrop(size, scale=(0.9, 1.0), ratio=(0.95, 1.05))` — max ~10% area loss.
+- Eval: `Resize((size, size))` directly — zero edge loss.
 
 **Next (Run 6):**
-- Train aug: `RandomResizedCrop(320, scale=(0.9, 1.0), ratio=(0.95, 1.05))` → max 10% area loss.
-- Eval aug: `Resize((320, 320))` directly, no crop → preserves full frame.
+- Train aug: tightened crop (above) — preserves c5 cabin context.
+- Eval aug: no crop — preserves periphery at inference.
+- `--img-size 320 → 384` — small far-side phone (c3) goes from ~10-20 px to ~12-24 px (+40% pixels on the cue); SAM map at layer4 goes from 10×10 to 12×12 (finer attention grid).
+- `--cutmix-p 0.3 → 0.15` — halves the rate at which c2/c8 (and c1/c3) get cross-pasted, sharpening "phone present vs absent" signal.
 - Same other hyperparams. New `--out-dir run6`.
-- Expected: c5 precision/recall noticeably up; small bump on overall acc; macro F1 likely up more than weighted F1 because c5 is the worst class.
+- Expected: c5 stays high (already fixed in Run 5 re-eval); c8 0.66 → 0.72-0.75; c3 0.77 → 0.80+; overall best EMA 0.84 → 0.86-0.87. Macro F1 should improve more than weighted F1.
+
+**Confusion-matrix sanity checks for Run 6 eval:**
+- c2 ↔ c8 block: should shrink most.
+- c1 ↔ c3 block: should stay near zero (validates no-HFlip choice).
+- c3 ↔ c4 block: if still high → hard ceiling from camera geometry; would need higher resolution (448+) or auxiliary phone-detection head.
+- c2 ↔ c1 block: should stay low; if it climbs after dropping CutMix p, regularization gap is the cause.
