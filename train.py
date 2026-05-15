@@ -63,13 +63,17 @@ class EMA:
 
     @torch.no_grad()
     def update(self, model: nn.Module) -> None:
-        msd = model.state_dict()
-        ssd = self.shadow.state_dict()
-        for k in ssd:
-            if ssd[k].dtype.is_floating_point:
-                ssd[k].mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+        m_params = dict(model.named_parameters())
+        s_params = dict(self.shadow.named_parameters())
+        for k, sp in s_params.items():
+            mp = m_params[k].detach()
+            if sp.dtype.is_floating_point:
+                sp.mul_(self.decay).add_(mp, alpha=1.0 - self.decay)
             else:
-                ssd[k].copy_(msd[k])
+                sp.copy_(mp)
+        m_buf = dict(model.named_buffers())
+        for k, sb in self.shadow.named_buffers():
+            sb.copy_(m_buf[k])
 
 
 def _unwrap(model: nn.Module) -> nn.Module:
