@@ -172,6 +172,7 @@ def main() -> None:
     ap.add_argument("--no-cbam", action="store_true",
                     help="Ablation baseline: ResNet-18 without CBAM blocks.")
     ap.add_argument("--ckpt-every", type=int, default=5)
+    ap.add_argument("--warmup-epochs", type=int, default=5)
     ap.add_argument("--tier1-epoch", type=int, default=20)
     ap.add_argument("--tier1-threshold", type=float, default=0.50)
     ap.add_argument("--seed", type=int, default=42)
@@ -210,8 +211,15 @@ def main() -> None:
                                 nesterov=True)
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * args.epochs
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=total_steps, eta_min=0.0,
+    warmup_steps = max(1, steps_per_epoch * args.warmup_epochs)
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps,
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=0.0,
+    )
+    scheduler = torch.optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps],
     )
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     ema = EMA(_unwrap(model), decay=args.ema_decay)
