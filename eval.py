@@ -270,13 +270,15 @@ def main() -> None:
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--use-ema", action="store_true", default=True)
     ap.add_argument("--no-ema", dest="use_ema", action="store_false")
+    ap.add_argument("--img-size", type=int, default=224,
+                    help="Eval input resolution. Should match the value used at training.")
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     mean, std = load_stats(args.splits_dir / "stats.json")
-    eval_tx = build_eval_transform(mean, std)
+    eval_tx = build_eval_transform(mean, std, size=args.img_size)
     val_df = pd.read_csv(args.splits_dir / "val.csv")
     val_ds = StateFarmDataset(
         args.splits_dir / "val.csv", args.data_root / "imgs" / "train", eval_tx,
