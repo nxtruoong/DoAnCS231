@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from augment import (
-    StateFarmDataset, build_eval_transform, build_train_transform,
+    StateFarmDataset, build_eval_transform, build_train_transform, build_trivialaugment_transform,
     cutmix_batch, load_stats, mixup_loss,
 )
 from model import build_model
@@ -178,6 +178,10 @@ def main() -> None:
     ap.add_argument("--minimal-aug", action="store_true",
                     help="Smoke test: strip ColorJitter/Grayscale/Blur/Erasing; "
                     "keep only RandomResizedCrop + Normalize.")
+    ap.add_argument("--trivialaugment", action="store_true",
+                    help="Use TrivialAugmentWide instead of hand-tuned ColorJitter+Blur+Grayscale stack.")
+    ap.add_argument("--img-size", type=int, default=224,
+                    help="Train/eval input resolution. RandomResizedCrop and CenterCrop both use this.")
     ap.add_argument("--ckpt-every", type=int, default=5)
     ap.add_argument("--warmup-epochs", type=int, default=5)
     ap.add_argument("--tier1-epoch", type=int, default=20)
@@ -194,16 +198,18 @@ def main() -> None:
     from torchvision import transforms
     if args.minimal_aug:
         train_tx = transforms.Compose([
-            transforms.RandomResizedCrop(224, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
+            transforms.RandomResizedCrop(args.img_size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std),
         ])
+    elif args.trivialaugment:
+        train_tx = build_trivialaugment_transform(mean, std, size=args.img_size)
     else:
-        train_tx = build_train_transform(mean, std)
+        train_tx = build_train_transform(mean, std, size=args.img_size)
         if args.no_grayscale:
             train_tx.transforms = [t for t in train_tx.transforms
                                    if not isinstance(t, transforms.RandomGrayscale)]
-    eval_tx = build_eval_transform(mean, std)
+    eval_tx = build_eval_transform(mean, std, size=args.img_size)
 
     img_root = args.data_root / "imgs" / "train"
     train_ds = StateFarmDataset(args.splits_dir / "train.csv", img_root, train_tx)
@@ -246,6 +252,8 @@ def main() -> None:
     log_path = args.out_dir / "history.json"
     print(f"Training {args.epochs} epochs | use_cbam={not args.no_cbam} | "
           f"use_cutmix={use_cutmix} | no_grayscale={args.no_grayscale} | "
+          f"trivialaugment={args.trivialaugment} | img_size={args.img_size} | "
+          f"ema_decay={args.ema_decay} | "
           f"device={device} | gpus={torch.cuda.device_count()}")
 
     t_start = time.time()

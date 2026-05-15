@@ -41,6 +41,21 @@ def build_train_transform(mean: list[float], std: list[float], size: int = 224) 
     ])
 
 
+def build_trivialaugment_transform(mean: list[float], std: list[float], size: int = 224) -> transforms.Compose:
+    """TrivialAugmentWide stack. No HFlip (op not in TrivialAugmentWide).
+
+    Replaces ColorJitter+Grayscale+Blur+RandomErasing in build_train_transform
+    with single learned-by-search policy. Stronger and simpler.
+    """
+    return transforms.Compose([
+        transforms.RandomResizedCrop(size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
+        transforms.TrivialAugmentWide(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.10), ratio=(0.3, 3.3), value="random"),
+    ])
+
+
 def build_eval_transform(mean: list[float], std: list[float], size: int = 224) -> transforms.Compose:
     return transforms.Compose([
         transforms.Resize(int(size * 256 / 224)),
