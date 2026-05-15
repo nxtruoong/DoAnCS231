@@ -1,0 +1,278 @@
+"""Training loop for ResNet-18 + CBAM on State Farm (subject-wise split).
+
+Defaults match the project plan:
+- SGD momentum=0.9, weight_decay=5e-4
+- Cosine LR 0.1 -> 0 over 40 epochs
+- CrossEntropy with label smoothing 0.1
+- CutMix p=0.5, alpha=1.0
+- EMA decay 0.999
+- batch 128 (single T4 + DataParallel on a second T4 if available)
+- Checkpoint every 5 epochs to --out-dir
+
+Tier-1 fallback trigger: at epoch 20, if val acc < 0.50, the script
+aborts so the operator can restart with --no-cutmix --no-grayscale. The
+augmentation toggles flip the relevant transforms / batch ops.
+
+Run on Kaggle:
+    python train.py \\
+        --data-root /kaggle/input/competitions/state-farm-distracted-driver-detection \\
+        --splits-dir /kaggle/working/splits \\
+        --out-dir /kaggle/working/run1
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from augment import (
+    StateFarmDataset, build_eval_transform, build_train_transform,
+    cutmix_batch, load_stats, mixup_loss,
+)
+from model import build_model
+
+
+def seed_everything(seed: int = 42) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+class EMA:
+    """Exponential moving average of model parameters."""
+
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = copy.deepcopy(model)
+        for p in self.shadow.parameters():
+            p.requires_grad_(False)
+        self.shadow.eval()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        msd = model.state_dict()
+        ssd = self.shadow.state_dict()
+        for k in ssd:
+            if ssd[k].dtype.is_floating_point:
+                ssd[k].mul_(self.decay).add_(msd[k].detach(), alpha=1.0 - self.decay)
+            else:
+                ssd[k].copy_(msd[k])
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    criterion: nn.Module,
+    device: torch.device,
+    ema: EMA,
+    *,
+    use_cutmix: bool,
+    cutmix_alpha: float,
+    cutmix_p: float,
+) -> tuple[float, float]:
+    model.train()
+    total_loss, total_correct, total = 0.0, 0, 0
+    pbar = tqdm(loader, desc="train", leave=False)
+    for images, labels in pbar:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        if use_cutmix:
+            images, lbl_a, lbl_b, lam = cutmix_batch(
+                images, labels, alpha=cutmix_alpha, p=cutmix_p,
+            )
+        else:
+            lbl_a, lbl_b, lam = labels, labels, 1.0
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = mixup_loss(criterion, logits, lbl_a, lbl_b, lam)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        ema.update(_unwrap(model))
+
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            total_loss += loss.item() * labels.size(0)
+        pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{scheduler.get_last_lr()[0]:.4f}")
+
+    return total_loss / total, total_correct / total
+
+
+@torch.no_grad()
+def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module,
+             device: torch.device) -> tuple[float, float]:
+    model.eval()
+    total_loss, total_correct, total = 0.0, 0, 0
+    for images, labels in tqdm(loader, desc="val", leave=False):
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = model(images)
+        loss = criterion(logits, labels)
+        preds = logits.argmax(dim=1)
+        total_correct += (preds == labels).sum().item()
+        total += labels.size(0)
+        total_loss += loss.item() * labels.size(0)
+    return total_loss / total, total_correct / total
+
+
+def save_checkpoint(path: Path, model: nn.Module, ema: EMA, optimizer, scheduler,
+                    epoch: int, best_val_acc: float, args_dict: dict) -> None:
+    torch.save({
+        "epoch": epoch,
+        "model": _unwrap(model).state_dict(),
+        "ema": ema.shadow.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "best_val_acc": best_val_acc,
+        "args": args_dict,
+    }, path)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", type=Path, required=True)
+    ap.add_argument("--splits-dir", type=Path, required=True)
+    ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--lr", type=float, default=0.1)
+    ap.add_argument("--momentum", type=float, default=0.9)
+    ap.add_argument("--weight-decay", type=float, default=5e-4)
+    ap.add_argument("--label-smoothing", type=float, default=0.1)
+    ap.add_argument("--ema-decay", type=float, default=0.999)
+    ap.add_argument("--cutmix-alpha", type=float, default=1.0)
+    ap.add_argument("--cutmix-p", type=float, default=0.5)
+    ap.add_argument("--no-cutmix", action="store_true")
+    ap.add_argument("--no-grayscale", action="store_true",
+                    help="Tier-1 fallback: drop RandomGrayscale from train aug.")
+    ap.add_argument("--no-cbam", action="store_true",
+                    help="Ablation baseline: ResNet-18 without CBAM blocks.")
+    ap.add_argument("--ckpt-every", type=int, default=5)
+    ap.add_argument("--tier1-epoch", type=int, default=20)
+    ap.add_argument("--tier1-threshold", type=float, default=0.50)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--data-parallel", action="store_true",
+                    help="Wrap model with DataParallel (use on Kaggle T4x2).")
+    args = ap.parse_args()
+
+    seed_everything(args.seed)
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    mean, std = load_stats(args.splits_dir / "stats.json")
+    train_tx = build_train_transform(mean, std)
+    if args.no_grayscale:
+        # Strip RandomGrayscale (index varies — find by class)
+        from torchvision import transforms
+        train_tx.transforms = [t for t in train_tx.transforms
+                               if not isinstance(t, transforms.RandomGrayscale)]
+    eval_tx = build_eval_transform(mean, std)
+
+    img_root = args.data_root / "imgs" / "train"
+    train_ds = StateFarmDataset(args.splits_dir / "train.csv", img_root, train_tx)
+    val_ds = StateFarmDataset(args.splits_dir / "val.csv", img_root, eval_tx)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(num_classes=10, use_cbam=not args.no_cbam).to(device)
+    if args.data_parallel and torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
+                                momentum=args.momentum, weight_decay=args.weight_decay,
+                                nesterov=True)
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * args.epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=0.0,
+    )
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    ema = EMA(_unwrap(model), decay=args.ema_decay)
+
+    history: list[dict] = []
+    best_val_acc = 0.0
+    use_cutmix = not args.no_cutmix
+    args_dict = vars(args).copy()
+    args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in args_dict.items()}
+
+    log_path = args.out_dir / "history.json"
+    print(f"Training {args.epochs} epochs | use_cbam={not args.no_cbam} | "
+          f"use_cutmix={use_cutmix} | no_grayscale={args.no_grayscale} | "
+          f"device={device} | gpus={torch.cuda.device_count()}")
+
+    t_start = time.time()
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, scheduler, criterion, device, ema,
+            use_cutmix=use_cutmix, cutmix_alpha=args.cutmix_alpha, cutmix_p=args.cutmix_p,
+        )
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        ema_val_loss, ema_val_acc = evaluate(ema.shadow.to(device), val_loader, criterion, device)
+
+        elapsed = (time.time() - t_start) / 60.0
+        print(f"[ep {epoch:02d}/{args.epochs}] "
+              f"train loss={train_loss:.4f} acc={train_acc:.4f} | "
+              f"val loss={val_loss:.4f} acc={val_acc:.4f} | "
+              f"ema val acc={ema_val_acc:.4f} | "
+              f"elapsed={elapsed:.1f} min")
+
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss, "train_acc": train_acc,
+            "val_loss": val_loss, "val_acc": val_acc,
+            "ema_val_loss": ema_val_loss, "ema_val_acc": ema_val_acc,
+            "lr": scheduler.get_last_lr()[0],
+        })
+        log_path.write_text(json.dumps(history, indent=2))
+
+        ema_acc = max(val_acc, ema_val_acc)
+        if ema_acc > best_val_acc:
+            best_val_acc = ema_acc
+            save_checkpoint(args.out_dir / "best.pt", model, ema, optimizer, scheduler,
+                            epoch, best_val_acc, args_dict)
+
+        if epoch % args.ckpt_every == 0:
+            save_checkpoint(args.out_dir / f"ckpt_e{epoch:02d}.pt",
+                            model, ema, optimizer, scheduler, epoch, best_val_acc, args_dict)
+
+        if epoch == args.tier1_epoch and ema_acc < args.tier1_threshold:
+            print(f"\nTier-1 trigger hit: val_acc {ema_acc:.4f} < {args.tier1_threshold} "
+                  f"at epoch {epoch}. Aborting. Restart with "
+                  f"--no-cutmix --no-grayscale.")
+            return
+
+    save_checkpoint(args.out_dir / "final.pt", model, ema, optimizer, scheduler,
+                    args.epochs, best_val_acc, args_dict)
+    print(f"\nDone. Best val acc: {best_val_acc:.4f}. "
+          f"Total time: {(time.time() - t_start) / 60.0:.1f} min")
+
+
+if __name__ == "__main__":
+    main()
