@@ -207,7 +207,9 @@ Recommend **B** for accuracy ceiling, **A** for diagnosing EMA contribution clea
 - Eval aug: no crop — preserves periphery at inference.
 - `--img-size 320 → 384` — small far-side phone (c3) goes from ~10-20 px to ~12-24 px (+40% pixels on the cue); SAM map at layer4 goes from 10×10 to 12×12 (finer attention grid).
 - `--cutmix-p 0.3 → 0.15` — halves the rate at which c2/c8 (and c1/c3) get cross-pasted, sharpening "phone present vs absent" signal.
+- `--epochs 50` and `--early-stop-patience 0` — run the full schedule, no early termination. Cosine reaches eta_min at ep 50.
 - Same other hyperparams. New `--out-dir run6`.
+- Estimated wall time: ~50 × ~3 min/ep at 384 input on T4×2 ≈ 150 min.
 - Expected: c5 stays high (already fixed in Run 5 re-eval); c8 0.66 → 0.72-0.75; c3 0.77 → 0.80+; overall best EMA 0.84 → 0.86-0.87. Macro F1 should improve more than weighted F1.
 
 **Confusion-matrix sanity checks for Run 6 eval:**
