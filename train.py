@@ -186,6 +186,11 @@ def main() -> None:
     ap.add_argument("--warmup-epochs", type=int, default=5)
     ap.add_argument("--tier1-epoch", type=int, default=20)
     ap.add_argument("--tier1-threshold", type=float, default=0.50)
+    ap.add_argument("--early-stop-patience", type=int, default=8,
+                    help="Stop if max(val_acc, ema_val_acc) does not improve by "
+                         ">= --early-stop-min-delta for N consecutive epochs. 0 disables.")
+    ap.add_argument("--early-stop-min-delta", type=float, default=0.005,
+                    help="Minimum gain over best-so-far counted as improvement.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--data-parallel", action="store_true",
                     help="Wrap model with DataParallel (use on Kaggle T4x2).")
@@ -245,6 +250,8 @@ def main() -> None:
 
     history: list[dict] = []
     best_val_acc = 0.0
+    es_best = 0.0
+    epochs_no_improve = 0
     use_cutmix = not args.no_cutmix
     args_dict = vars(args).copy()
     args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in args_dict.items()}
@@ -297,8 +304,20 @@ def main() -> None:
                   f"--no-cutmix --no-grayscale.")
             return
 
+        if args.early_stop_patience > 0:
+            if ema_acc >= es_best + args.early_stop_min_delta:
+                es_best = ema_acc
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+            if epochs_no_improve >= args.early_stop_patience:
+                print(f"\nEarly stop: no improvement >= {args.early_stop_min_delta} "
+                      f"for {epochs_no_improve} epochs (best={es_best:.4f}). "
+                      f"Stopping at epoch {epoch}/{args.epochs}.")
+                break
+
     save_checkpoint(args.out_dir / "final.pt", model, ema, optimizer, scheduler,
-                    args.epochs, best_val_acc, args_dict)
+                    epoch, best_val_acc, args_dict)
     print(f"\nDone. Best val acc: {best_val_acc:.4f}. "
           f"Total time: {(time.time() - t_start) / 60.0:.1f} min")
 
