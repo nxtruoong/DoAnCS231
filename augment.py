@@ -31,7 +31,7 @@ def load_stats(stats_path: Path) -> tuple[list[float], list[float]]:
 
 def build_train_transform(mean: list[float], std: list[float], size: int = 224) -> transforms.Compose:
     return transforms.Compose([
-        transforms.RandomResizedCrop(size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
+        transforms.RandomResizedCrop(size, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
         transforms.RandomGrayscale(p=0.1),
         transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 0.8)),
@@ -48,7 +48,7 @@ def build_trivialaugment_transform(mean: list[float], std: list[float], size: in
     with single learned-by-search policy. Stronger and simpler.
     """
     return transforms.Compose([
-        transforms.RandomResizedCrop(size, scale=(0.7, 1.0), ratio=(0.85, 1.15)),
+        transforms.RandomResizedCrop(size, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
         transforms.TrivialAugmentWide(),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
@@ -58,8 +58,7 @@ def build_trivialaugment_transform(mean: list[float], std: list[float], size: in
 
 def build_eval_transform(mean: list[float], std: list[float], size: int = 224) -> transforms.Compose:
     return transforms.Compose([
-        transforms.Resize(int(size * 256 / 224)),
-        transforms.CenterCrop(size),
+        transforms.Resize((size, size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
