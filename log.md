@@ -763,3 +763,123 @@ optional `--resume`) plus runtime flags (`batch=48`, `num_workers=2`,
 drop `--data-parallel`) brought peak host RAM to ~9 GB. Resume from
 `ckpt_e45.pt` recovered the run with zero metric loss. Apply same
 config to Run 8.
+
+---
+
+## Run 8 — Pose-fusion (single CNN + 36-d MediaPipe pose), no CutMix [AWAITING RESULTS]
+
+**Status:** training launched on Kaggle T4×2, results pending.
+
+**Config:** `--pose-fusion --epochs 60 --batch-size 48 --num-workers 2
+--lr 0.03 --warmup-epochs 2 --ema-decay 0.99 --full-size 384
+--label-smoothing 0.1 --early-stop-patience 8
+--early-stop-min-delta 0.000 --ckpt-every 2 --data-parallel` (commit
+`2bf5d0c`, 2x T4)
+
+### Architecture
+
+| Component | Run 6 (baseline) | Run 7 (regressed) | Run 8 |
+|---|---|---|---|
+| CNN backbones | 1 (ResNet18+CBAM @ 384) | 2 (full + face crop) | **1 (ResNet18+CBAM @ 384)** |
+| Pose features | — | — | **36-d MediaPipe Pose → MLP(128)** |
+| Fusion | Linear(512 → 10) | concat 512+512 → MLP(256) → 10 | **concat 512+128 → MLP(256) → 10** |
+| Total params | ~11.2 M | ~22.7 M | **~11.4 M** |
+| CutMix | p=0.15 | p=0.20 | **disabled** |
+
+Single CNN backbone, same capacity as Run 6. Pose features replace the
+second CNN stream that Run 7 used (and that regressed).
+
+### Pose feature design (36-d vector per image)
+
+Pre-computed once by `extract_pose.py` via MediaPipe Pose, cached to
+`splits/pose.parquet`. Features grouped:
+
+- **Head + torso (8):** yaw proxy, pitch, roll, shoulder twist, ear
+  visibility, global gate.
+- **Wrists (8):** x/y/visibility of both wrists, vertical asymmetry,
+  horizontal spread.
+- **Elbows (4):** x/y of both elbows (arm-reach proxies).
+- **Hand orientation (4):** index-wrist Δy (texting), thumb-pinky
+  spread (grip vs flat).
+- **Hip anchors (4):** both hips, define "lap" reference.
+- **Derived (4):** wrist-hip Δy (lap proximity), wrist-shoulder Δx
+  (reach direction).
+- **Visibility gates (4):** per-side elbow + hip visibility.
+
+### Why this architecture
+
+Run 7 added a second CNN backbone to learn body posture implicitly from
+pixels — failed because 22k from-scratch training images can't fund two
+ResNets that don't share information. **MediaPipe Pose already emits
+the postural signal directly** (wrist x/y, elbow positions, ear
+yaw) as a tiny precomputed vector. Feeding it as engineered features
+costs ~0.2 M params (the projection MLP) instead of 11 M (a second
+ResNet). Same signal, ~50× fewer parameters, no overfit pressure.
+
+Note: original Run 8 plan was a three-stream architecture (full +
+bottom-crop hand CNN + 8-d head pose). Dropped during pre-flight after
+realising the pose vector could be widened to subsume the hand-stream's
+role. Architecture pivot history kept in `RUN8_PLAN.md` for reference.
+
+### Pre-flight pose feature sanity (commit `2bf5d0c`)
+
+Inspected mean pose features per class on the 22k training images
+(only images where MediaPipe succeeded):
+
+- **Detection rates:** all classes ≥ 0.80, average 0.89. Highest c9
+  (0.988), lowest c2 (0.804). Acceptable — pose vector includes
+  per-landmark visibility flags, model learns to gate.
+- **p0 yaw proxy:** c9 most negative (-0.096), c0/c3 least negative
+  (-0.047). Direction correct, spread tight (0.05) but combined with
+  shoulder twist (p3) carries the gaze signal.
+- **p28 left-wrist lap proximity:** c3 clear outlier (-0.254) vs
+  rest (-0.33 to -0.41). Direct discriminator for Run 7's c3 dumping.
+- **p29 right-wrist lap proximity:** c7 only class with positive sign
+  (+0.127), everyone else negative. Single-feature isolator for c7
+  reach-behind.
+- **p31 right-arm reach direction:** clean three-cluster structure —
+  wheel-grip group (c0/c3/c4/c5/c9 at +0.40-0.45), inward-reach group
+  (c1/c2/c6/c8 at +0.15-0.28), backward-reach (c7 at +0.04). Cleanest
+  pairwise discriminator in the design.
+
+Pose features behave exactly where Run 7 broke. Outstanding risk: c8
+(hair) has no object-cue in pose space — must rely on full-stream
+pixels to distinguish from c2 (phone-right) and c6 (drinking).
+
+### Expected per-class outlook (predictions, awaiting eval)
+
+| class | Run 6 F1 | Run 7 F1 | Run 8 target | mechanism |
+|---|---:|---:|---:|---|
+| c0 safe | 0.66 | 0.51 | **≥ 0.78** | no CutMix → clean c0; pose wrist-on-wheel |
+| c1 text right | 0.95 | 0.94 | hold ≥ 0.93 | unchanged |
+| c2 phone right | 0.95 | 0.96 | hold ≥ 0.93 | unchanged |
+| c3 text left | 0.92 | 0.55 | **≥ 0.85** | p28 isolates lap; no CutMix |
+| c4 phone left | 0.97 | 0.93 | hold ≥ 0.93 | unchanged |
+| c5 radio | 0.94 | 0.69 | **≥ 0.88** | p31 separates from c7 |
+| c6 drinking | 0.94 | 0.94 | hold ≥ 0.93 | unchanged |
+| c7 reach behind | 0.98 | 0.88 | **≥ 0.94** | p29 sign + p31 small |
+| c8 hair/makeup | 0.75 | 0.65 | **≥ 0.73** | pose can't see object; CNN carries |
+| c9 talk passenger | 0.68 | 0.44 | **≥ 0.80** | p0 + p3 + best det rate |
+| **macro F1** | **0.873** | 0.748 | **≥ 0.85**, target **0.88** | — |
+
+### Stop conditions
+
+- Best EMA val acc < 0.75 after epoch 20 → pose features
+  uninformative. Halt, inspect `ckpt_e10.pt` per-class.
+- Pose detection rate < 60% in a class → that class falls back to
+  CNN-only; expected weak but not catastrophic.
+- Training acc < 0.85 by epoch 15 → optimization issue (pose-MLP init,
+  fusion-head LR). Compare against Run 6 ep 15 (~0.84).
+
+### Runtime estimate
+
+- Pose precompute: one-time, ~18 min CPU (already done).
+- Training: 60 ep × ~1.8 min/ep on T4×2 DP = **~1.8 hr**.
+- Eval: ~5 min.
+- Total wall: **~2.0 hr** (well under 9-hr Kaggle session cap).
+
+### Result (PENDING)
+
+To be filled in when training completes. Plan: append per-class table
++ pivot decision + comparison to Run 6 / Run 7 in the same format as
+the prior run entries.
