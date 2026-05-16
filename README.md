@@ -112,17 +112,22 @@ python train.py ... --no-cbam --out-dir run_baseline
 
 ## Demo (local)
 
-Gradio web demo lives in [`demo/`](demo/DEMO_HOWTO.md). Both Run 6
-and Run 7 supported. CPU inference fine.
+Gradio web demo lives in [`demo/`](demo/DEMO_HOWTO.md). Run 6, Run 7,
+and Run 8 supported. CPU inference fine (Run 8 adds ~50 ms MediaPipe
+overhead per image).
 
 ```powershell
 cd demo
-python app.py --ckpt checkpoints/best.pt --stats splits/stats.json            # Run 6
-python app_twostream.py --ckpt checkpoints/run7_best.pt --stats splits/stats.json   # Run 7
+python app.py            --ckpt checkpoints/best.pt        --stats splits/stats.json   # Run 6
+python app_twostream.py  --ckpt checkpoints/run7_best.pt   --stats splits/stats.json   # Run 7
+python app_posefusion.py --ckpt checkpoints/run8_best.pt   --stats splits/stats.json   # Run 8
 ```
 
-See `demo/DEMO_HOWTO.md` for full setup (deps, Kaggle artifact
-download, HuggingFace Spaces deployment, troubleshooting).
+Run 8 demo extracts MediaPipe pose features on-the-fly from the
+uploaded image (no `pose.parquet` needed) and visualises both the
+CBAM heatmap and the pose landmarks the model conditions on. See
+`demo/DEMO_HOWTO.md` for full setup (deps, Kaggle artifact download,
+HuggingFace Spaces deployment, troubleshooting).
 
 ## Reproducibility caveat
 

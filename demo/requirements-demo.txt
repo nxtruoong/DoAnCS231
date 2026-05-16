@@ -1,0 +1,9 @@
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+pillow>=10.0
+opencv-python>=4.8
+gradio>=4.0
+# Run 8 (pose fusion) demo only
+mediapipe==0.10.13       # pinned: newer wheels lazy-load mp.solutions and break
+polars>=0.20
