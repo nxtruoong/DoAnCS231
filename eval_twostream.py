@@ -27,26 +27,26 @@ from torch.utils.data import DataLoader
 
 from augment import CLASSES, load_stats
 from augment_twostream import (
-    POSE_DIM, ThreeStreamDataset, TwoStreamDataset,
+    POSE_DIM, PoseFusionDataset, TwoStreamDataset,
     build_face_eval_transform, build_full_eval_transform,
-    build_hand_eval_transform, load_pose_lookup,
+    load_pose_lookup,
 )
 from eval import (
     CLASS_NAMES, attention_grid as _attn_single, failure_cases as _fail_single,
     per_driver_breakdown, plot_confusion_matrix, plot_training_curves,
     write_classification_report,
 )
-from model_twostream import build_threestream, build_twostream
+from model_twostream import build_posefusion, build_twostream
 
 
 def detect_mode(ckpt_path: Path) -> str:
-    """Return 'three' or 'two' based on checkpoint metadata."""
+    """Return 'pose' (Run 8) or 'two' (Run 7) based on checkpoint metadata."""
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    if ckpt.get("three_stream", False):
-        return "three"
+    if ckpt.get("pose_fusion", False):
+        return "pose"
     saved_args = ckpt.get("args", {})
-    if bool(saved_args.get("three_stream", False)):
-        return "three"
+    if bool(saved_args.get("pose_fusion", False)):
+        return "pose"
     return "two"
 
 
@@ -54,10 +54,10 @@ def load_model_for_ckpt(ckpt_path: Path, use_ema: bool = True) -> tuple[torch.nn
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     saved_args = ckpt.get("args", {})
     use_cbam = not saved_args.get("no_cbam", False)
-    mode = "three" if (ckpt.get("three_stream", False)
-                       or bool(saved_args.get("three_stream", False))) else "two"
-    if mode == "three":
-        model = build_threestream(num_classes=10, use_cbam=use_cbam, pose_dim=POSE_DIM)
+    mode = "pose" if (ckpt.get("pose_fusion", False)
+                      or bool(saved_args.get("pose_fusion", False))) else "two"
+    if mode == "pose":
+        model = build_posefusion(num_classes=10, use_cbam=use_cbam, pose_dim=POSE_DIM)
     else:
         model = build_twostream(num_classes=10, use_cbam=use_cbam)
     state = ckpt["ema" if use_ema else "model"]
@@ -79,12 +79,11 @@ def collect_predictions(model, loader, device, mode: str = "two"):
     all_preds, all_labels, all_probs = [], [], []
     model.to(device)
     for batch in loader:
-        if mode == "three":
-            full, hand, pose, labels = batch
-            pose = pose.to(device, non_blocking=True)
+        if mode == "pose":
+            full, pose, labels = batch
             full = full.to(device, non_blocking=True)
-            hand = hand.to(device, non_blocking=True)
-            logits = model(full, hand, pose)
+            pose = pose.to(device, non_blocking=True)
+            logits = model(full, pose)
         else:
             full, face, labels = batch
             full = full.to(device, non_blocking=True)
@@ -109,12 +108,11 @@ def attention_grid_twostream(model, loader, mean, std, device, out_path: Path,
     picked: dict[int, list[tuple[np.ndarray, np.ndarray, int]]] = {i: [] for i in range(10)}
     model.to(device)
     for batch in loader:
-        if mode == "three":
-            full, hand, pose, labels = batch
+        if mode == "pose":
+            full, pose, labels = batch
             full = full.to(device, non_blocking=True)
-            hand = hand.to(device, non_blocking=True)
             pose = pose.to(device, non_blocking=True)
-            logits = model(full, hand, pose)
+            logits = model(full, pose)
         else:
             full, face, labels = batch
             full = full.to(device, non_blocking=True)
@@ -160,12 +158,11 @@ def failure_cases_twostream(model, loader, mean, std, device, out_path: Path,
     model.to(device)
     failures: list[tuple[np.ndarray, np.ndarray, int, int, float]] = []
     for batch in loader:
-        if mode == "three":
-            full, hand, pose, labels = batch
+        if mode == "pose":
+            full, pose, labels = batch
             full = full.to(device, non_blocking=True)
-            hand = hand.to(device, non_blocking=True)
             pose = pose.to(device, non_blocking=True)
-            logits = model(full, hand, pose)
+            logits = model(full, pose)
         else:
             full, face, labels = batch
             full = full.to(device, non_blocking=True)
@@ -220,14 +217,9 @@ def main() -> None:
     ap.add_argument("--full-size", type=int, default=384)
     ap.add_argument("--face-size", type=int, default=224)
     ap.add_argument("--top-frac", type=float, default=0.50)
-    # Run 8 three-stream eval flags
+    # Run 8 pose-fusion eval flags
     ap.add_argument("--pose-parquet", type=Path, default=None,
-                    help="Required when evaluating a three-stream (Run 8) checkpoint")
-    ap.add_argument("--hand-size", type=int, default=224)
-    ap.add_argument("--hand-top-frac", type=float, default=0.45)
-    ap.add_argument("--hand-bottom-frac", type=float, default=1.0)
-    ap.add_argument("--hand-left-frac", type=float, default=0.20)
-    ap.add_argument("--hand-right-frac", type=float, default=0.85)
+                    help="Required when evaluating a pose-fusion (Run 8) checkpoint")
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -240,20 +232,15 @@ def main() -> None:
     tx_full = build_full_eval_transform(mean, std, size=args.full_size)
     val_df = pd.read_csv(args.splits_dir / "val.csv")
 
-    if mode == "three":
+    if mode == "pose":
         if args.pose_parquet is None or not args.pose_parquet.exists():
             raise SystemExit(
-                "Three-stream checkpoint requires --pose-parquet PATH "
+                "Pose-fusion checkpoint requires --pose-parquet PATH "
                 "pointing to the precomputed pose.parquet from extract_pose.py")
-        tx_hand = build_hand_eval_transform(
-            mean, std, size=args.hand_size,
-            top_frac=args.hand_top_frac, bottom_frac=args.hand_bottom_frac,
-            left_frac=args.hand_left_frac, right_frac=args.hand_right_frac,
-        )
         pose_lookup = load_pose_lookup(args.pose_parquet)
-        val_ds = ThreeStreamDataset(args.splits_dir / "val.csv",
-                                    args.data_root / "imgs" / "train",
-                                    tx_full, tx_hand, pose_lookup)
+        val_ds = PoseFusionDataset(args.splits_dir / "val.csv",
+                                   args.data_root / "imgs" / "train",
+                                   tx_full, pose_lookup)
     else:
         tx_face = build_face_eval_transform(mean, std, size=args.face_size,
                                             top_frac=args.top_frac)

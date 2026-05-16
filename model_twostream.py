@@ -56,28 +56,33 @@ def build_twostream(num_classes: int = 10, use_cbam: bool = True) -> TwoStreamCB
     return TwoStreamCBAM(num_classes=num_classes, use_cbam=use_cbam)
 
 
-# --- Run 8 three-stream (full + hand + pose) -------------------------------
+# --- Run 8 pose-fusion (full CNN + rich pose vector) -----------------------
 
-class ThreeStreamCBAM(nn.Module):
-    """Two CNN backbones (full + hand) + pose-vector MLP fusion.
+class PoseFusionCBAM(nn.Module):
+    """Single ResNet18+CBAM + rich-pose MLP fusion.
 
-    Pose vector is an 8-d head-pose descriptor precomputed via
-    MediaPipe Pose. A small MLP projects it to 64-d before
-    concatenation with the two 512-d CNN features.
+    Pose vector is a 36-d body-pose descriptor precomputed via
+    MediaPipe Pose: head (8) + wrists (8) + elbows (4) + fingers (4) +
+    hips (4) + derived (4) + visibility gates (4). MLP projects it to
+    128-d before concatenation with the 512-d CNN features.
+
+    The dedicated hand-crop stream from the original Run 8 plan was
+    dropped: wrist + finger landmarks already encode hand position,
+    making a second CNN backbone redundant and overfit-prone.
     """
 
     def __init__(self, num_classes: int = 10, use_cbam: bool = True,
-                 pose_dim: int = 8, pose_hidden: int = 64,
+                 pose_dim: int = 36, pose_hidden: int = 128,
                  fusion_hidden: int = 256, dropout: float = 0.3):
         super().__init__()
         self.full_stream = build_model(num_classes=num_classes, use_cbam=use_cbam)
-        self.hand_stream = build_model(num_classes=num_classes, use_cbam=use_cbam)
         self.pose_proj = nn.Sequential(
             nn.Linear(pose_dim, pose_hidden),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(pose_hidden, pose_hidden),
         )
-        fused_dim = 512 + 512 + pose_hidden
+        fused_dim = 512 + pose_hidden
         self.classifier = nn.Sequential(
             nn.Linear(fused_dim, fusion_hidden),
             nn.ReLU(inplace=True),
@@ -85,19 +90,18 @@ class ThreeStreamCBAM(nn.Module):
             nn.Linear(fusion_hidden, num_classes),
         )
 
-    def forward(self, x_full: torch.Tensor, x_hand: torch.Tensor,
+    def forward(self, x_full: torch.Tensor,
                 x_pose: torch.Tensor) -> torch.Tensor:
         f_full = self.full_stream.features(x_full)
-        f_hand = self.hand_stream.features(x_hand)
         f_pose = self.pose_proj(x_pose)
-        fused = torch.cat([f_full, f_hand, f_pose], dim=1)
+        fused = torch.cat([f_full, f_pose], dim=1)
         return self.classifier(fused)
 
     def last_spatial_attention(self) -> torch.Tensor | None:
         return self.full_stream.last_spatial_attention()
 
 
-def build_threestream(num_classes: int = 10, use_cbam: bool = True,
-                      pose_dim: int = 8) -> ThreeStreamCBAM:
-    return ThreeStreamCBAM(num_classes=num_classes, use_cbam=use_cbam,
-                           pose_dim=pose_dim)
+def build_posefusion(num_classes: int = 10, use_cbam: bool = True,
+                     pose_dim: int = 36) -> PoseFusionCBAM:
+    return PoseFusionCBAM(num_classes=num_classes, use_cbam=use_cbam,
+                          pose_dim=pose_dim)

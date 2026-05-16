@@ -60,7 +60,7 @@ See [`CONTEXT.md`](CONTEXT.md) for the full glossary and decisions, and
 | Run 5 (canonical baseline) | ResNet18+CBAM, 320 input | 0.83 |
 | Run 6 (current headline) | ResNet18+CBAM, 384 input, tightened crop | **0.873** |
 | Run 7 | Two-stream (full + top-crop face), CutMix p=0.2 | 0.748 (regressed) |
-| Run 8 (planned) | Three-stream (full + hand-crop + MediaPipe pose), no CutMix | target ≥ 0.85 |
+| Run 8 (planned) | Pose-fusion (full CNN + 36-d MediaPipe pose), no CutMix | target ≥ 0.85 |
 
 See `log.md` for per-run diagnosis and `RUN8_PLAN.md` for the Run 8
 motivation.

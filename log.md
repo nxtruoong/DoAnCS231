@@ -741,11 +741,17 @@ lives in:
   captures the head but doesn't *isolate* it — model has to find it
   inside a 224×224 crop that also contains shoulders/seat.
 
-Run 8 replaces face stream with **hand/lap stream** (bottom-center
-crop) and injects **MediaPipe head-pose scalars** for explicit gaze
-signal. Drops CutMix entirely (label-noise hypothesis above).
+Run 8 was originally planned as a three-stream architecture
+(full + bottom-crop hand stream + 8-d head pose vector). During pre-
+flight sanity checks the architecture pivoted: MediaPipe Pose already
+emits wrist/elbow/finger landmarks, so a dedicated hand-crop CNN
+backbone is redundant *if* the pose feature vector is widened to
+include those landmarks. Three-stream → **pose-fusion** (single
+ResNet18+CBAM + 36-d MediaPipe pose vector). Half the params of
+three-stream, comparable to Run 6 baseline. Drops CutMix entirely
+(label-noise hypothesis above).
 
-Full plan: `RUN8_PLAN.md`.
+Full plan: `RUN8_PLAN.md`. Runbook: `RUN8_HOWTO.md`.
 
 ### Aux finding: memory budget
 

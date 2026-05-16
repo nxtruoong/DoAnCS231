@@ -21,7 +21,7 @@ from torchvision import transforms
 
 from augment import CLASS_TO_IDX
 
-POSE_DIM = 8
+POSE_DIM = 36   # Run 8: head + wrists + elbows + fingers + hips + derived + gates
 
 
 class TopCrop:
@@ -122,45 +122,6 @@ def build_face_eval_transform(mean, std, size: int = 224,
     ])
 
 
-# --- Run 8 hand-stream transforms ------------------------------------------
-
-def build_hand_train_transform(mean, std, size: int = 224,
-                               top_frac: float = 0.45,
-                               bottom_frac: float = 1.0,
-                               left_frac: float = 0.20,
-                               right_frac: float = 0.85) -> transforms.Compose:
-    """Crop driver's lap + lower wheel region, then standard aug.
-
-    Defaults: bottom 55% (top=0.45..bottom=1.0), center 65% width
-    (left=0.20..right=0.85). Cuts dashboard above wheel and right-side
-    passenger window glare. Captures phone-in-hand (c3, c4), radio
-    (c5), drink (c6), and the "empty" lap region defining c0/c9.
-    """
-    return transforms.Compose([
-        RegionCrop(top_frac=top_frac, bottom_frac=bottom_frac,
-                   left_frac=left_frac, right_frac=right_frac),
-        transforms.RandomResizedCrop(size, scale=(0.85, 1.0), ratio=(0.9, 1.1)),
-        transforms.TrivialAugmentWide(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-        transforms.RandomErasing(p=0.15, scale=(0.02, 0.06), ratio=(0.3, 3.3), value="random"),
-    ])
-
-
-def build_hand_eval_transform(mean, std, size: int = 224,
-                              top_frac: float = 0.45,
-                              bottom_frac: float = 1.0,
-                              left_frac: float = 0.20,
-                              right_frac: float = 0.85) -> transforms.Compose:
-    return transforms.Compose([
-        RegionCrop(top_frac=top_frac, bottom_frac=bottom_frac,
-                   left_frac=left_frac, right_frac=right_frac),
-        transforms.Resize((size, size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
-
-
 # --- Run 8 pose lookup -----------------------------------------------------
 
 def load_pose_lookup(parquet_path: Path) -> dict[str, "np.ndarray"]:
@@ -203,23 +164,23 @@ class TwoStreamDataset(Dataset):
         return full, face, CLASS_TO_IDX[row["classname"]]
 
 
-class ThreeStreamDataset(Dataset):
-    """Returns (full_tensor, hand_tensor, pose_vec, label) per item.
+class PoseFusionDataset(Dataset):
+    """Run 8 dataset: returns (full_tensor, pose_vec, label) per item.
 
-    Pose vector is looked up from a precomputed dict by image filename.
-    Missing entries are zero-imputed (gating bit p7=0 by construction).
+    Single CNN stream + pose vector. No hand crop — wrist/elbow/finger
+    landmarks in the pose vector replace the dedicated hand-crop stream
+    that Run 8 originally proposed (see RUN8_PLAN.md for rationale on
+    the pivot).
     """
 
     def __init__(self, csv_path: Path, img_root: Path,
                  full_transform: transforms.Compose,
-                 hand_transform: transforms.Compose,
                  pose_lookup: dict[str, "np.ndarray"]):
         import numpy as np
         import pandas as pd
         self.df = pd.read_csv(csv_path).reset_index(drop=True)
         self.img_root = Path(img_root)
         self.tx_full = full_transform
-        self.tx_hand = hand_transform
         self.pose_lookup = pose_lookup
         self._zero_pose = np.zeros(POSE_DIM, dtype="float32")
 
@@ -232,10 +193,9 @@ class ThreeStreamDataset(Dataset):
         with Image.open(path) as im:
             img = im.convert("RGB")
             full = self.tx_full(img)
-            hand = self.tx_hand(img)
         pose_np = self.pose_lookup.get(row["img"], self._zero_pose)
         pose = torch.from_numpy(pose_np.copy())
-        return full, hand, pose, CLASS_TO_IDX[row["classname"]]
+        return full, pose, CLASS_TO_IDX[row["classname"]]
 
 
 def cutmix_twostream(

@@ -128,13 +128,13 @@ driver-distraction-cbam/
 ├── model.py                     # ResNet-18 + CBAM (Run 1-6)
 ├── train.py / eval.py           # single-stream training + eval (Run 1-6)
 ├── augment.py                   # single-stream aug + CutMix
-├── model_twostream.py           # TwoStreamCBAM (Run 7) + ThreeStreamCBAM (Run 8)
-├── augment_twostream.py         # two/three-stream datasets, crops, pose lookup
-├── train_twostream.py           # multi-stream trainer, --three-stream for Run 8
-├── eval_twostream.py            # auto-dispatch eval for two/three-stream ckpts
+├── model_twostream.py           # TwoStreamCBAM (Run 7) + PoseFusionCBAM (Run 8)
+├── augment_twostream.py         # two-stream + pose-fusion datasets, pose lookup
+├── train_twostream.py           # multi-stream trainer, --pose-fusion for Run 8
+├── eval_twostream.py            # auto-dispatch eval for two-stream + pose-fusion ckpts
 ├── extract_pose.py              # Run 8 MediaPipe head-pose precompute
 ├── RUN7_PLAN.md / RUN7_HOWTO.md # Run 7 design + runbook (two-stream)
-├── RUN8_PLAN.md / RUN8_HOWTO.md # Run 8 design + runbook (three-stream + pose)
+├── RUN8_PLAN.md / RUN8_HOWTO.md # Run 8 design + runbook (pose fusion)
 ├── demo/                        # Gradio demos (Run 6 + Run 7) — see demo/DEMO_HOWTO.md
 ├── notebooks/01..04
 ├── checkpoints/                 # gitignored

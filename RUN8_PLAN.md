@@ -1,180 +1,180 @@
-# Run 8 Plan — Hand-stream + MediaPipe head-pose fusion, no CutMix
+# Run 8 Plan — Pose-fusion (single CNN + 36-d MediaPipe pose), no CutMix
 
 Status: PLANNED. Predecessor: Run 7 (two-stream full+face, eval acc
 0.751, see `log.md`).
 
 ## Motivation
 
-Run 7 architecture (full + top-crop face) regressed by ~9pp on macro F1
-vs Run 6 single-stream. Per-class eval revealed bipolar failure:
+Run 7 (two-stream: full + top-crop face) regressed by ~9pp on macro F1
+vs Run 6. Per-class eval revealed bipolar failure: starving classes c0
+(R=0.38), c5 (R=0.52), c9 (R=0.29); dumping classes c3 (P=0.38) and c7
+(P=0.80, R=0.98). Discriminator for these classes is **body posture**
+— where the hands are, where the head is looking — not pixels in any
+single crop region.
 
-- **Starving classes:** c0 (R=0.38), c5 (R=0.52), c9 (R=0.29).
-- **Dumping classes:** c3 (P=0.38, R=0.99), c7 (P=0.80, R=0.98).
+Run 7's mistake was using a second CNN backbone to *learn* posture
+implicitly from pixels. ResNet18+CBAM on 22k images = limited capacity
+to discover "this wrist coordinate equals lap-region" from scratch.
+Worse, two CNNs doubled overfit pressure on driver-specific cues
+(face, shirt, seat) that don't transfer across subjects.
 
-Discriminative information for the failing classes lives in regions
-the face stream **does not see**:
-
-- c3 (text-left): phone in left hand, near lap / lower steering wheel.
-- c0 (safe): absence of object in lap region.
-- c9 (talk-passenger): head yaw to the right (cue is in *isolated*
-  face landmarks, not a coarse top-crop that includes shoulders).
-- c5 (radio): right hand on center console, below the wheel.
-
-Top-50% crop captures the head but cuts away exactly the lap/console
-region where the discriminator for half the failing classes lives.
+**Pose features are the cheap structural insight Run 7 missed.**
+MediaPipe Pose returns 33 body landmarks per image — wrist, elbow,
+finger, shoulder, hip positions are all directly available. Feeding
+them as engineered features lets the model use posture without
+spending CNN capacity to rediscover it.
 
 ## Architecture change
 
-| Component | Run 7 | Run 8 |
+| Component | Run 6 (baseline) | Run 7 | Run 8 |
+|---|---|---|---|
+| Stream A | ResNet18+CBAM @ 384 | Same | **Same** |
+| Stream B | — | ResNet18+CBAM top-crop @ 224 | — |
+| Pose features | — | — | **36-d MediaPipe vector → MLP(128)** |
+| Fusion | Linear(512→10) | concat 512+512 → Linear(1024→256) → 10 | **concat 512+128 → Linear(640→256) → 10** |
+| Total params | ~11.2 M | ~22.7 M | **~11.4 M** (≈ Run 6 + 0.2 M pose head) |
+| CutMix | p=0.30, α=0.5 | p=0.20, α=0.5 | **disabled** |
+| Loss | CE + label smoothing 0.1 | Same | Same |
+
+Single CNN, same capacity as Run 6, plus a small pose MLP. **No hand
+crop, no second CNN.**
+
+## Why dropping the hand crop
+
+Original Run 8 plan included a dedicated bottom-center crop CNN as
+"hand stream". After analysis, that stream is **redundant** when the
+pose vector includes wrist/elbow/finger landmarks:
+
+| Original "hand stream" role | Covered by pose vector? |
+|---|---|
+| where is left wrist | yes — `p8, p9, p12` |
+| where is right wrist | yes — `p10, p11, p13` |
+| is hand on lap / wheel / face | yes — `p28, p29` (wrist–hip Δy) |
+| left vs right arm reach | yes — `p30, p31` (wrist–shoulder Δx) |
+| finger gesture (typing pose) | yes — `p20, p21, p22, p23` (index–wrist Δy, thumb–pinky spread) |
+| **is there a phone/cup in hand** | no — only full-stream pixels see this |
+| **fine object texture** | no — only full-stream pixels |
+
+The hand stream's only unique value was higher per-pixel resolution on
+the lap region for small-object discrimination. With full stream at
+384×384, lap region already gets ~120×80 pixels — adequate for
+phone-in-hand detection. Adding a second ResNet18+CBAM (11M params)
+for the same job is a bad trade.
+
+## The 36-d pose feature vector
+
+Precomputed by `extract_pose.py` once, cached to
+`splits/pose.parquet`. Per-image features:
+
+| Indices | Group | What it captures |
 |---|---|---|
-| Stream A | Full image @ 384 (ResNet18+CBAM) | Same |
-| Stream B | Top-50% crop @ 224 (ResNet18+CBAM) | **Hand/lap crop @ 224** (ResNet18+CBAM) — bottom 55%, center 65% width |
-| Stream C | — | **Head-pose vector** (8-dim, precomputed via MediaPipe Pose) → MLP(64) |
-| Fusion | concat 512+512 → Linear(1024→256) → 10 | concat 512+512+64 → Linear(1088→256) → 10 |
-| CutMix | p=0.20, α=0.5 | **Disabled** |
-| Loss | CE + label smoothing 0.1 | Same |
-| Other hyperparams | unchanged | unchanged |
+| p0–p7 | Head + torso | yaw, pitch, roll, shoulder twist, ear visibility, detection gate |
+| p8–p15 | Wrists | x/y/visibility of both wrists, vertical asymmetry, horizontal spread |
+| p16–p19 | Elbows | x/y of both elbows (arm reach proxies) |
+| p20–p23 | Hand orientation | index–wrist Δy (texting), thumb–pinky spread (grip vs flat) |
+| p24–p27 | Hip anchors | both hips, define "lap" reference frame |
+| p28–p31 | Derived | wrist–hip Δy (lap proximity), wrist–shoulder Δx (reach direction) |
+| p32–p35 | Visibility gates | elbow + hip visibility (per-side) |
 
-Three streams of input but only two image streams (pose is a tiny
-scalar vector). Compute ≈ Run 7.
-
-## Why hand stream (bottom crop)
-
-State Farm dashcam fixed mount → driver's lap/lower-wheel region is
-always in the lower-center of the frame. Static crop captures the
-discriminative region for phone-in-hand classes (c3, c4 cross-check)
-and the "empty" region for c0/c9.
-
-Crop box: `top=0.45, bottom=1.0, left=0.20, right=0.85`. Cuts the
-right-side window glare (passenger seat) and the dashboard above the
-wheel. Sanity-plot 20 samples before training.
-
-## Why MediaPipe head-pose
-
-c9 (talk-passenger) is defined by head yaw to the right. Run 7's face
-stream had this information *somewhere* in its 224x224 crop but never
-isolated it — model learned generic posture instead of gaze. Injecting
-8 pose scalars provides an **explicit, low-dimensional** gaze signal
-the fusion head can directly weight, bypassing the need for the CNN
-to discover head pose from pixels.
-
-**MediaPipe Pose (not Face Mesh).** Face Mesh fails on extreme yaw
-(profile view = c9) and on occluded face (hand near face = c6, c8) —
-exactly the cases we want to help. Pose ships nose/ear/eye landmarks
-that survive at extreme yaw because it tracks the whole skeleton.
-
-Pose features (8-dim):
-
-```
-p0 = (r_ear.x - l_ear.x)               # signed yaw proxy (look right < 0)
-p1 = nose.y - mean(eye.y)              # pitch proxy
-p2 = r_eye.y - l_eye.y                 # roll proxy
-p3 = r_shoulder.x - l_shoulder.x       # torso twist (c7 reach-behind, c9 turn)
-p4 = r_shoulder.y - l_shoulder.y       # shoulder slope
-p5 = l_ear.visibility                  # left ear visible? (look-right hides it)
-p6 = r_ear.visibility                  # right ear visible? (look-left hides it)
-p7 = 1.0 if detection succeeded else 0 # gating bit; zero-imputed otherwise
-```
-
-Stored as parquet keyed by image filename. Loaded into a Python dict
-at training start, O(1) lookup per sample.
+All features in normalised [0, 1] image coordinates from MediaPipe.
+Missing detections zero-imputed (gating bit p7=0 → model learns "pose
+unavailable, fall back to CNN").
 
 ## Why drop CutMix
 
 c0 = absence of distractor by definition. CutMix pastes a patch from
-another image into c0, polluting the "no-distractor" signal. With
-shared permutation across two image streams (Run 7's setup), the
-pasted patch *also* lands in the hand-crop stream → hand stream
-learns "c0 sometimes has phone-shaped patches in lap region" → c0
-boundary blurred → predictions leak into the dense neighbouring class
-(c3). Same logic for c9.
+another class into c0, polluting "no-distractor" signal → c0 boundary
+blurs → predictions leak into nearest dense class (c3 in Run 7). Same
+logic for c9. Removing CutMix cleans up the negative class.
 
-Run 7's CutMix p=0.20 was modest, but the two-stream sharing
-amplified its effect. Cleanest test: ablate CutMix entirely. If c0/c9
-recall recovers and other classes hold, the diagnosis is confirmed.
+Empirical justification: Run 7 with CutMix p=0.2 produced the c0/c9
+collapse. Run 6 with CutMix p=0.15 had milder version of same problem
+(c0 F1 dropped from Run 5's higher value). Trend: lower CutMix helps
+passive classes. Zero CutMix = end of that gradient.
 
-If macro F1 regresses on c1/c2/c4 vs Run 7's eval, can revisit with
-class-conditional CutMix (skip batches dominated by c0/c9) — defer to
-Run 9.
+Risk: c1/c2 may lose some regularisation. Mitigation: label-smoothing
+0.1 + RandomErasing already in stack, both provide regularisation
+without object-mixing.
 
 ## Implementation
 
 ### Files added
 
-- `extract_pose.py` — runs MediaPipe Pose once over all training
-  images, writes `splits/pose.parquet` (filename + 8 pose scalars).
+- `extract_pose.py` — MediaPipe Pose extractor, 36-d feature vector
+  per image, output `splits/pose.parquet`.
 
 ### Files extended
 
-- `augment_twostream.py` — adds `RegionCrop` (general bottom/top/side
-  crop), `build_hand_train_transform`, `build_hand_eval_transform`,
-  `ThreeStreamDataset` (yields full, hand, pose_vec, label).
-- `model_twostream.py` — adds `ThreeStreamCBAM` (two CNN streams + pose
-  MLP fusion).
-- `train_twostream.py` — adds `--three-stream` flag. When set: loads
-  pose parquet, builds `ThreeStreamDataset` and `ThreeStreamCBAM`,
-  forward takes (full, hand, pose). Pose is **not** mixed by CutMix
-  even if CutMix is enabled (pose is global per-image; mixing yaw
-  values is meaningless).
-- `eval_twostream.py` — load + eval path for three-stream ckpts.
+- `augment_twostream.py` — `POSE_DIM=36`, `PoseFusionDataset` (yields
+  full + pose + label), `load_pose_lookup`. `RegionCrop` utility kept
+  (general-purpose). Hand-crop transforms removed.
+- `model_twostream.py` — `PoseFusionCBAM`: single ResNet18+CBAM + 36→128
+  pose MLP → 512+128 fused → MLP(256) → 10.
+- `train_twostream.py` — `--pose-fusion` flag. Loads pose parquet,
+  builds `PoseFusionDataset` + `PoseFusionCBAM`, forward takes
+  (full, pose). Pose is global per-image; CutMix disabled on this
+  path even if not explicitly `--no-cutmix`.
+- `eval_twostream.py` — auto-dispatches: `pose_fusion` flag in ckpt
+  metadata → builds `PoseFusionCBAM`, requires `--pose-parquet`.
 
 ### Files unchanged
 
-`model.py`, `augment.py`, `train.py`, `eval.py`. Existing Run 1-6
-single-stream + Run 7 two-stream paths remain runnable.
+`model.py`, `augment.py`, `train.py`, `eval.py`. Run 1-6 single-stream
+and Run 7 two-stream paths remain runnable.
 
 ## Expected gains
 
-Targeted per-class deltas vs Run 7 eval:
+Targeted per-class deltas vs Run 7 eval (and vs Run 6 where relevant):
 
-| class | Run 7 F1 | Run 8 target | mechanism |
-|---|---:|---:|---|
-| c0 safe | 0.51 | 0.75+ | drop CutMix (clean "no distractor" signal); hand stream sees empty lap explicitly |
-| c3 text-left | 0.55 | 0.85+ | hand stream isolates phone-in-lap; P recovers as model stops dumping |
-| c5 radio | 0.69 | 0.85+ | hand stream centers on console area; right-arm distinct from c7 |
-| c7 reach-behind | 0.88 | 0.92+ | pose-vec shoulder twist (p3, p4) separates from c5 |
-| c8 hair/makeup | 0.65 | 0.72+ | head-pose pitch (p1) separates from c2 |
-| c9 talk-passenger | 0.44 | 0.80+ | explicit yaw signal (p0) + ear visibility flags |
-| c1, c2, c4, c6 | 0.93-0.96 | hold ≥0.93 | no architectural reason to regress |
-| **macro F1** | 0.748 | **0.85-0.88** | matches Run 6 + addresses Run 7 regressions |
+| class | Run 6 F1 | Run 7 F1 | Run 8 target | mechanism |
+|---|---:|---:|---:|---|
+| c0 safe | 0.66 | 0.51 | **≥ 0.80** | no CutMix → clean c0 boundary; pose wrist-on-wheel signal |
+| c3 text-left | 0.92 | 0.55 | **≥ 0.88** | pose wrist-on-lap + finger-up signal; no CutMix |
+| c5 radio | 0.94 | 0.69 | **≥ 0.90** | pose right-arm-forward distinguishes from c7 (right-arm-back) |
+| c7 reach-behind | 0.98 | 0.88 | **≥ 0.94** | pose r-wrist–shoulder Δx large positive |
+| c8 hair/makeup | 0.75 | 0.65 | **≥ 0.75** | pose wrist-near-head + full-stream object check |
+| c9 talk-passenger | 0.68 | 0.44 | **≥ 0.82** | pose yaw + shoulder twist directly encode head turn |
+| c1/c2/c4/c6 | 0.93–0.97 | 0.93–0.96 | hold ≥0.93 | no architectural reason to regress |
+| **macro F1** | **0.873** | 0.748 | **≥ 0.88** | matches or exceeds Run 6 |
 
-Conservative outcome: matches Run 6 (0.873 macro F1). Optimistic: passes
-Run 6 by 1-3pp.
+Conservative outcome: match Run 6 (0.873 macro F1). Optimistic:
+0.88-0.90 driven by pose-disambiguated c0/c9.
 
 ## Risks
 
-- **MediaPipe detection rate < 70%** on dashcam imagery (cabin lighting,
-  partial occlusion). Mitigation: pose-vec includes `p7` gating bit;
-  zero-impute lets model learn "pose missing = use CNN only". If rate
-  is poor, fall back to YOLOv8n-face for head bbox (same fusion path,
-  different feature source).
-- **Hand crop misses object on tall drivers.** Mitigation: crop box
-  `top=0.45` keeps a generous margin. Sanity-check 20 random samples
-  before training, adjust if needed.
-- **Resume from Run 7 checkpoint impossible.** Different architecture
-  (ThreeStreamCBAM vs TwoStreamCBAM) → state dict shape mismatch. Run 8
-  trains from scratch.
+- **MediaPipe detection rate < 70%** on dashcam imagery. Mitigation:
+  per-landmark visibility flags in the pose vector + global gate
+  (p7); model learns "pose missing → trust CNN only".
+- **Pose features over-rated by fusion MLP.** Pose is 36-d, CNN is
+  512-d. Concat directly might let model lean too hard on pose,
+  losing pixel discrimination for object-identity classes (c2, c6).
+  Mitigation: pose MLP has Dropout(0.3) before projection to 128;
+  fusion has further Dropout(0.3).
+- **Cannot resume from Run 7 checkpoint.** Different architecture.
+  Run 8 trains from scratch (~60 epochs).
 
 ## Stop conditions
 
-- Best EMA val acc still < 0.80 after epoch 30 → architecture not
-  helping. Inspect per-class metrics on `ckpt_e30.pt`. If only c0/c9
-  recovered but c3 still low → hand crop too high; widen.
-- Pose detection rate < 60% in `extract_pose.py` summary → halt before
-  training. Switch to YOLO-face fallback.
-- Training acc < 0.85 by epoch 15 → optimization issue (pose-MLP init,
-  fusion-head LR). Compare against Run 7 ep 15 train acc (0.90).
+- Best EMA val acc < 0.75 after epoch 20 → pose features not
+  helping. Inspect `ckpt_e10.pt` per-class metrics. If still bipolar
+  (c0/c9 starving) → pose features uninformative for this dataset.
+- Pose detection rate < 60% in `extract_pose.py` summary → halt
+  before training. Switch to YOLOv8n-face for head-bbox features.
+- Training acc < 0.85 by epoch 15 → optimisation issue. Compare
+  against Run 6 ep 15 (~0.84).
 
 ## Runtime estimate
 
-- **Pose precompute:** one-time, ~22k images × ~50 ms CPU = ~18 min on
-  Kaggle CPU. Cached to parquet.
-- **Training:** 60 epochs, batch 48, `num_workers=2`, two CNN streams
-  (same compute as Run 7) + tiny pose MLP. No CutMix → ~3% faster
-  per-step than Run 7 (skips beta sample + index copy).
-  - 2x T4 DataParallel: ~3.2 min/epoch × 60 = **~3.2 hours**.
-  - Single T4 (DP-disabled, safer host RAM): ~5.5 min/epoch × 60 =
-    **~5.5 hours**.
+- **Pose precompute:** one-time, ~18 min CPU on Kaggle, 22k imgs ×
+  ~50 ms.
+- **Training:** 60 epochs, batch 48, `num_workers=2`, single CNN
+  (≈ Run 6 compute) + tiny pose MLP.
+  - 2x T4 DataParallel: ~1.8 min/epoch × 60 = **~1.8 hr**.
+  - Single T4 (DP-disabled, safer host RAM): ~3.0 min/epoch × 60 =
+    **~3.0 hr**.
 - **Eval:** ~5 min on val split.
-- **Total wall (DP path):** pose 18 min + train ~3.2 h + eval 5 min ≈
-  **~3.6 hours**. Comfortably under Kaggle's 9-hour session cap.
+- **Total wall (DP path):** pose 18 min + train ~1.8 h + eval 5 min ≈
+  **~2.2 hours**. Well under Kaggle's 9-hour session cap.
+
+Total wall is ~40% less than the original three-stream Run 8 plan
+(~3.6 hr) because we dropped one ResNet18+CBAM backbone.
