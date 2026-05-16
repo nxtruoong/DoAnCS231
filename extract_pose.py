@@ -27,10 +27,14 @@ import time
 from pathlib import Path
 
 import cv2
-import mediapipe as mp
 import numpy as np
 import polars as pl
 from tqdm import tqdm
+
+# Explicit submodule import bypasses lazy `mediapipe.solutions` resolution,
+# which can fail on Kaggle when TF/XLA registers CUDA factories before
+# MediaPipe is initialized (Solutions submodule silently fails to load).
+from mediapipe.python.solutions import pose as mp_pose
 
 POSE_DIM = 8
 
@@ -80,7 +84,7 @@ def main() -> None:
     if not paths:
         raise SystemExit(f"No .jpg images under {args.img_root}")
 
-    pose = mp.solutions.pose.Pose(
+    pose = mp_pose.Pose(
         static_image_mode=True,
         model_complexity=1,
         enable_segmentation=False,
