@@ -154,13 +154,15 @@ def main() -> None:
     ap.add_argument("--no-cbam", action="store_true")
     ap.add_argument("--full-size", type=int, default=384)
     ap.add_argument("--face-size", type=int, default=224)
-    ap.add_argument("--top-frac", type=float, default=0.45)
+    ap.add_argument("--top-frac", type=float, default=0.50)
     ap.add_argument("--ckpt-every", type=int, default=5)
     ap.add_argument("--warmup-epochs", type=int, default=2)
     ap.add_argument("--early-stop-patience", type=int, default=8)
     ap.add_argument("--early-stop-min-delta", type=float, default=0.005)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--data-parallel", action="store_true")
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="Path to checkpoint (.pt) to resume from")
     args = ap.parse_args()
 
     seed_everything(args.seed)
@@ -180,10 +182,16 @@ def main() -> None:
     val_ds   = TwoStreamDataset(args.splits_dir / "val.csv", img_root,
                                 tx_full_eval, tx_face_eval)
 
+    loader_kwargs = dict(
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=2 if args.num_workers > 0 else None,
+    )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                              drop_last=True, **loader_kwargs)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=True)
+                              **loader_kwargs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_twostream(num_classes=10, use_cbam=not args.no_cbam).to(device)
@@ -212,17 +220,33 @@ def main() -> None:
     best_val_acc = 0.0
     es_best = 0.0
     epochs_no_improve = 0
+    start_epoch = 1
     use_cutmix = not args.no_cutmix
     args_dict = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
 
     log_path = args.out_dir / "history.json"
+
+    if args.resume is not None and args.resume.exists():
+        ckpt = torch.load(args.resume, map_location=device)
+        _unwrap(model).load_state_dict(ckpt["model"])
+        ema.shadow.load_state_dict(ckpt["ema"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start_epoch = int(ckpt["epoch"]) + 1
+        best_val_acc = float(ckpt.get("best_val_acc", 0.0))
+        es_best = best_val_acc
+        if log_path.exists():
+            history = json.loads(log_path.read_text())
+            history = [h for h in history if h["epoch"] < start_epoch]
+        print(f"Resumed from {args.resume} at epoch {start_epoch} "
+              f"(best_val_acc={best_val_acc:.4f})")
     print(f"Two-stream training {args.epochs} epochs | full={args.full_size} "
           f"face={args.face_size} top_frac={args.top_frac} | batch={args.batch_size} | "
           f"cutmix=({args.cutmix_p},{args.cutmix_alpha}) | device={device} | "
           f"gpus={torch.cuda.device_count()}")
 
     t_start = time.time()
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, scheduler, criterion, device, ema,
             use_cutmix=use_cutmix, cutmix_alpha=args.cutmix_alpha, cutmix_p=args.cutmix_p,
