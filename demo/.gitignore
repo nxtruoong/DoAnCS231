@@ -1,0 +1,11 @@
+checkpoints/*.pt
+checkpoints/*.pth
+checkpoints/*.bin
+splits/*.json
+splits/*.csv
+examples/*.jpg
+examples/*.jpeg
+examples/*.png
+!examples/.gitkeep
+!checkpoints/.gitkeep
+!splits/.gitkeep
