@@ -37,13 +37,33 @@ See [`CONTEXT.md`](CONTEXT.md) for the full glossary and decisions, and
 |-- data_prep.py           # subject-wise split + dataset stats
 |-- augment.py             # heavy aug pipeline + CutMix + dataset class
 |-- model.py               # ResNet-18 + CBAM
-|-- train.py               # full training loop (EMA, cosine, CutMix, tier-1 trigger)
+|-- train.py               # single-stream training loop (Run 1-6)
 |-- eval.py                # classification_report + figures + attention viz
-|-- app.py                 # Gradio demo
+|-- model_twostream.py     # TwoStreamCBAM (Run 7) + ThreeStreamCBAM (Run 8)
+|-- augment_twostream.py   # two/three-stream datasets, crops, pose lookup
+|-- train_twostream.py     # multi-stream training loop, --three-stream flag for Run 8
+|-- eval_twostream.py      # auto-dispatch eval for two/three-stream ckpts
+|-- extract_pose.py        # Run 8 MediaPipe head-pose precompute → pose.parquet
+|-- log.md                 # per-run training log + per-class diagnosis
+|-- RUN7_PLAN.md / RUN7_HOWTO.md  # Run 7 design + runbook (two-stream)
+|-- RUN8_PLAN.md / RUN8_HOWTO.md  # Run 8 design + runbook (three-stream + pose)
+|-- demo/                  # Gradio demos (Run 6 + Run 7) — see demo/DEMO_HOWTO.md
 |-- notebooks/             # Kaggle notebook templates (run on T4x2 free tier)
 |-- requirements.txt
 `-- README.md
 ```
+
+**Architecture history:**
+
+| Run | Architecture | Eval macro F1 |
+|---|---|---:|
+| Run 5 (canonical baseline) | ResNet18+CBAM, 320 input | 0.83 |
+| Run 6 (current headline) | ResNet18+CBAM, 384 input, tightened crop | **0.873** |
+| Run 7 | Two-stream (full + top-crop face), CutMix p=0.2 | 0.748 (regressed) |
+| Run 8 (planned) | Three-stream (full + hand-crop + MediaPipe pose), no CutMix | target ≥ 0.85 |
+
+See `log.md` for per-run diagnosis and `RUN8_PLAN.md` for the Run 8
+motivation.
 
 ## Quickstart (Kaggle T4x2)
 
@@ -92,15 +112,17 @@ python train.py ... --no-cbam --out-dir run_baseline
 
 ## Demo (local)
 
-```bash
-python app.py --ckpt checkpoints/best.pt --stats splits/stats.json
+Gradio web demo lives in [`demo/`](demo/DEMO_HOWTO.md). Both Run 6
+and Run 7 supported. CPU inference fine.
+
+```powershell
+cd demo
+python app.py --ckpt checkpoints/best.pt --stats splits/stats.json            # Run 6
+python app_twostream.py --ckpt checkpoints/run7_best.pt --stats splits/stats.json   # Run 7
 ```
 
-Note: `app.py` currently hardcodes 224x224 input — mismatches Run 5
-training at 320x320. Demo accuracy will lag eval metrics until aligned.
-
-For HuggingFace Spaces deployment: set `CKPT_PATH`, `STATS_PATH`,
-`EXAMPLES_DIR` env vars; the Space runs `python app.py`.
+See `demo/DEMO_HOWTO.md` for full setup (deps, Kaggle artifact
+download, HuggingFace Spaces deployment, troubleshooting).
 
 ## Reproducibility caveat
 

@@ -11,3 +11,6 @@ opencv-python>=4.8
 gradio>=4.0
 onnx>=1.14
 onnxruntime>=1.16
+# Run 8 (three-stream)
+mediapipe>=0.10        # head-pose extraction in extract_pose.py
+polars>=0.20           # parquet I/O for pose.parquet

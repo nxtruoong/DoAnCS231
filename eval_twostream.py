@@ -27,35 +27,69 @@ from torch.utils.data import DataLoader
 
 from augment import CLASSES, load_stats
 from augment_twostream import (
-    TwoStreamDataset, build_face_eval_transform, build_full_eval_transform,
+    POSE_DIM, ThreeStreamDataset, TwoStreamDataset,
+    build_face_eval_transform, build_full_eval_transform,
+    build_hand_eval_transform, load_pose_lookup,
 )
 from eval import (
     CLASS_NAMES, attention_grid as _attn_single, failure_cases as _fail_single,
     per_driver_breakdown, plot_confusion_matrix, plot_training_curves,
     write_classification_report,
 )
-from model_twostream import build_twostream
+from model_twostream import build_threestream, build_twostream
 
 
-def load_twostream(ckpt_path: Path, use_ema: bool = True) -> torch.nn.Module:
+def detect_mode(ckpt_path: Path) -> str:
+    """Return 'three' or 'two' based on checkpoint metadata."""
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if ckpt.get("three_stream", False):
+        return "three"
+    saved_args = ckpt.get("args", {})
+    if bool(saved_args.get("three_stream", False)):
+        return "three"
+    return "two"
+
+
+def load_model_for_ckpt(ckpt_path: Path, use_ema: bool = True) -> tuple[torch.nn.Module, str]:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     saved_args = ckpt.get("args", {})
     use_cbam = not saved_args.get("no_cbam", False)
-    model = build_twostream(num_classes=10, use_cbam=use_cbam)
+    mode = "three" if (ckpt.get("three_stream", False)
+                       or bool(saved_args.get("three_stream", False))) else "two"
+    if mode == "three":
+        model = build_threestream(num_classes=10, use_cbam=use_cbam, pose_dim=POSE_DIM)
+    else:
+        model = build_twostream(num_classes=10, use_cbam=use_cbam)
     state = ckpt["ema" if use_ema else "model"]
     model.load_state_dict(state, strict=True)
     model.eval()
+    return model, mode
+
+
+def load_twostream(ckpt_path: Path, use_ema: bool = True) -> torch.nn.Module:
+    """Back-compat alias: returns a two-stream model only."""
+    model, mode = load_model_for_ckpt(ckpt_path, use_ema=use_ema)
+    if mode != "two":
+        raise RuntimeError(f"Expected two-stream ckpt, got mode={mode}")
     return model
 
 
 @torch.no_grad()
-def collect_predictions(model, loader, device):
+def collect_predictions(model, loader, device, mode: str = "two"):
     all_preds, all_labels, all_probs = [], [], []
     model.to(device)
-    for full, face, labels in loader:
-        full = full.to(device, non_blocking=True)
-        face = face.to(device, non_blocking=True)
-        logits = model(full, face)
+    for batch in loader:
+        if mode == "three":
+            full, hand, pose, labels = batch
+            pose = pose.to(device, non_blocking=True)
+            full = full.to(device, non_blocking=True)
+            hand = hand.to(device, non_blocking=True)
+            logits = model(full, hand, pose)
+        else:
+            full, face, labels = batch
+            full = full.to(device, non_blocking=True)
+            face = face.to(device, non_blocking=True)
+            logits = model(full, face)
         probs = F.softmax(logits, dim=1)
         all_probs.append(probs.cpu().numpy())
         all_preds.append(logits.argmax(dim=1).cpu().numpy())
@@ -66,20 +100,26 @@ def collect_predictions(model, loader, device):
 
 @torch.no_grad()
 def attention_grid_twostream(model, loader, mean, std, device, out_path: Path,
-                             n_per_class: int = 1) -> None:
-    """Use SAM from the full stream. Wrap two-stream forward into a single
-    callable so we can reuse eval.attention_grid (which expects a single
-    image input)."""
+                             n_per_class: int = 1, mode: str = "two") -> None:
+    """Use SAM from the full stream."""
     import torch.nn.functional as F
     import matplotlib.pyplot as plt
     from eval import _denorm_to_uint8, overlay_sam
 
     picked: dict[int, list[tuple[np.ndarray, np.ndarray, int]]] = {i: [] for i in range(10)}
     model.to(device)
-    for full, face, labels in loader:
-        full = full.to(device, non_blocking=True)
-        face = face.to(device, non_blocking=True)
-        logits = model(full, face)
+    for batch in loader:
+        if mode == "three":
+            full, hand, pose, labels = batch
+            full = full.to(device, non_blocking=True)
+            hand = hand.to(device, non_blocking=True)
+            pose = pose.to(device, non_blocking=True)
+            logits = model(full, hand, pose)
+        else:
+            full, face, labels = batch
+            full = full.to(device, non_blocking=True)
+            face = face.to(device, non_blocking=True)
+            logits = model(full, face)
         preds = logits.argmax(dim=1)
         sam = model.last_spatial_attention()  # full-stream SAM
         sam_up = F.interpolate(sam, size=full.shape[-2:], mode="bilinear", align_corners=False)
@@ -112,17 +152,25 @@ def attention_grid_twostream(model, loader, mean, std, device, out_path: Path,
 
 @torch.no_grad()
 def failure_cases_twostream(model, loader, mean, std, device, out_path: Path,
-                            n: int = 12) -> None:
+                            n: int = 12, mode: str = "two") -> None:
     import torch.nn.functional as F
     import matplotlib.pyplot as plt
     from eval import _denorm_to_uint8, overlay_sam
 
     model.to(device)
     failures: list[tuple[np.ndarray, np.ndarray, int, int, float]] = []
-    for full, face, labels in loader:
-        full = full.to(device, non_blocking=True)
-        face = face.to(device, non_blocking=True)
-        logits = model(full, face)
+    for batch in loader:
+        if mode == "three":
+            full, hand, pose, labels = batch
+            full = full.to(device, non_blocking=True)
+            hand = hand.to(device, non_blocking=True)
+            pose = pose.to(device, non_blocking=True)
+            logits = model(full, hand, pose)
+        else:
+            full, face, labels = batch
+            full = full.to(device, non_blocking=True)
+            face = face.to(device, non_blocking=True)
+            logits = model(full, face)
         probs = F.softmax(logits, dim=1)
         preds = probs.argmax(dim=1)
         sam = model.last_spatial_attention()
@@ -171,25 +219,52 @@ def main() -> None:
     ap.add_argument("--no-ema", dest="use_ema", action="store_false")
     ap.add_argument("--full-size", type=int, default=384)
     ap.add_argument("--face-size", type=int, default=224)
-    ap.add_argument("--top-frac", type=float, default=0.45)
+    ap.add_argument("--top-frac", type=float, default=0.50)
+    # Run 8 three-stream eval flags
+    ap.add_argument("--pose-parquet", type=Path, default=None,
+                    help="Required when evaluating a three-stream (Run 8) checkpoint")
+    ap.add_argument("--hand-size", type=int, default=224)
+    ap.add_argument("--hand-top-frac", type=float, default=0.45)
+    ap.add_argument("--hand-bottom-frac", type=float, default=1.0)
+    ap.add_argument("--hand-left-frac", type=float, default=0.20)
+    ap.add_argument("--hand-right-frac", type=float, default=0.85)
     args = ap.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    model, mode = load_model_for_ckpt(args.ckpt, use_ema=args.use_ema)
+    print(f"Loaded {mode}-stream model from {args.ckpt} (use_ema={args.use_ema})")
+
     mean, std = load_stats(args.splits_dir / "stats.json")
     tx_full = build_full_eval_transform(mean, std, size=args.full_size)
-    tx_face = build_face_eval_transform(mean, std, size=args.face_size,
-                                        top_frac=args.top_frac)
     val_df = pd.read_csv(args.splits_dir / "val.csv")
-    val_ds = TwoStreamDataset(args.splits_dir / "val.csv",
-                              args.data_root / "imgs" / "train",
-                              tx_full, tx_face)
+
+    if mode == "three":
+        if args.pose_parquet is None or not args.pose_parquet.exists():
+            raise SystemExit(
+                "Three-stream checkpoint requires --pose-parquet PATH "
+                "pointing to the precomputed pose.parquet from extract_pose.py")
+        tx_hand = build_hand_eval_transform(
+            mean, std, size=args.hand_size,
+            top_frac=args.hand_top_frac, bottom_frac=args.hand_bottom_frac,
+            left_frac=args.hand_left_frac, right_frac=args.hand_right_frac,
+        )
+        pose_lookup = load_pose_lookup(args.pose_parquet)
+        val_ds = ThreeStreamDataset(args.splits_dir / "val.csv",
+                                    args.data_root / "imgs" / "train",
+                                    tx_full, tx_hand, pose_lookup)
+    else:
+        tx_face = build_face_eval_transform(mean, std, size=args.face_size,
+                                            top_frac=args.top_frac)
+        val_ds = TwoStreamDataset(args.splits_dir / "val.csv",
+                                  args.data_root / "imgs" / "train",
+                                  tx_full, tx_face)
+
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                             num_workers=args.num_workers, pin_memory=True)
 
-    model = load_twostream(args.ckpt, use_ema=args.use_ema)
-    y_true, y_pred, _ = collect_predictions(model, val_loader, device)
+    y_true, y_pred, _ = collect_predictions(model, val_loader, device, mode=mode)
 
     write_classification_report(y_true, y_pred, args.out_dir / "classification_report.txt")
     plot_confusion_matrix(y_true, y_pred, args.out_dir / "confusion_matrix.png")
@@ -199,9 +274,9 @@ def main() -> None:
     if args.history_json and args.history_json.exists():
         plot_training_curves(args.history_json, args.out_dir / "training_curves.png")
     attention_grid_twostream(model, val_loader, mean, std, device,
-                             args.out_dir / "attention_grid.png", n_per_class=1)
+                             args.out_dir / "attention_grid.png", n_per_class=1, mode=mode)
     failure_cases_twostream(model, val_loader, mean, std, device,
-                            args.out_dir / "failures.png", n=12)
+                            args.out_dir / "failures.png", n=12, mode=mode)
     print(f"\nAll artifacts written to {args.out_dir}")
 
 
