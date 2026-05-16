@@ -28,10 +28,13 @@ from tqdm import tqdm
 
 from augment import load_stats, mixup_loss
 from augment_twostream import (
-    TwoStreamDataset, build_face_eval_transform, build_face_train_transform,
-    build_full_eval_transform, build_full_train_transform, cutmix_twostream,
+    POSE_DIM, ThreeStreamDataset, TwoStreamDataset,
+    build_face_eval_transform, build_face_train_transform,
+    build_full_eval_transform, build_full_train_transform,
+    build_hand_eval_transform, build_hand_train_transform,
+    cutmix_twostream, load_pose_lookup,
 )
-from model_twostream import build_twostream
+from model_twostream import build_threestream, build_twostream
 
 
 def seed_everything(seed: int = 42) -> None:
@@ -122,7 +125,56 @@ def evaluate(model, loader, criterion, device):
     return total_loss / total, total_correct / total
 
 
+def train_one_epoch_three(model, loader, optimizer, scheduler, criterion, device, ema):
+    """Run 8 three-stream train loop. No CutMix on this path (pose vec
+    is per-image; mixing yaw is meaningless). Drop CutMix entirely."""
+    model.train()
+    total_loss, total_correct, total = 0.0, 0, 0
+    pbar = tqdm(loader, desc="train", leave=False)
+    for full, hand, pose, labels in pbar:
+        full = full.to(device, non_blocking=True)
+        hand = hand.to(device, non_blocking=True)
+        pose = pose.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(full, hand, pose)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        ema.update(_unwrap(model))
+
+        with torch.no_grad():
+            preds = logits.argmax(dim=1)
+            total_correct += (preds == labels).sum().item()
+            total += labels.size(0)
+            total_loss += loss.item() * labels.size(0)
+        pbar.set_postfix(loss=f"{loss.item():.3f}", lr=f"{scheduler.get_last_lr()[0]:.4f}")
+
+    return total_loss / total, total_correct / total
+
+
+@torch.no_grad()
+def evaluate_three(model, loader, criterion, device):
+    model.eval()
+    total_loss, total_correct, total = 0.0, 0, 0
+    for full, hand, pose, labels in tqdm(loader, desc="val", leave=False):
+        full = full.to(device, non_blocking=True)
+        hand = hand.to(device, non_blocking=True)
+        pose = pose.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        logits = model(full, hand, pose)
+        loss = criterion(logits, labels)
+        preds = logits.argmax(dim=1)
+        total_correct += (preds == labels).sum().item()
+        total += labels.size(0)
+        total_loss += loss.item() * labels.size(0)
+    return total_loss / total, total_correct / total
+
+
 def save_checkpoint(path, model, ema, optimizer, scheduler, epoch, best_val_acc, args_dict):
+    three_stream = bool(args_dict.get("three_stream", False))
     torch.save({
         "epoch": epoch,
         "model": _unwrap(model).state_dict(),
@@ -131,7 +183,8 @@ def save_checkpoint(path, model, ema, optimizer, scheduler, epoch, best_val_acc,
         "scheduler": scheduler.state_dict(),
         "best_val_acc": best_val_acc,
         "args": args_dict,
-        "two_stream": True,
+        "two_stream": not three_stream,
+        "three_stream": three_stream,
     }, path)
 
 
@@ -163,24 +216,55 @@ def main() -> None:
     ap.add_argument("--data-parallel", action="store_true")
     ap.add_argument("--resume", type=Path, default=None,
                     help="Path to checkpoint (.pt) to resume from")
+    # Run 8 three-stream flags
+    ap.add_argument("--three-stream", action="store_true",
+                    help="Use ThreeStreamCBAM: full + hand crop + MediaPipe pose")
+    ap.add_argument("--pose-parquet", type=Path, default=None,
+                    help="Path to splits/pose.parquet (required if --three-stream)")
+    ap.add_argument("--hand-size", type=int, default=224)
+    ap.add_argument("--hand-top-frac", type=float, default=0.45)
+    ap.add_argument("--hand-bottom-frac", type=float, default=1.0)
+    ap.add_argument("--hand-left-frac", type=float, default=0.20)
+    ap.add_argument("--hand-right-frac", type=float, default=0.85)
     args = ap.parse_args()
+
+    if args.three_stream and args.pose_parquet is None:
+        ap.error("--three-stream requires --pose-parquet PATH")
 
     seed_everything(args.seed)
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     mean, std = load_stats(args.splits_dir / "stats.json")
     tx_full_train = build_full_train_transform(mean, std, size=args.full_size)
-    tx_face_train = build_face_train_transform(mean, std, size=args.face_size,
-                                               top_frac=args.top_frac)
     tx_full_eval  = build_full_eval_transform(mean, std, size=args.full_size)
-    tx_face_eval  = build_face_eval_transform(mean, std, size=args.face_size,
-                                              top_frac=args.top_frac)
 
     img_root = args.data_root / "imgs" / "train"
-    train_ds = TwoStreamDataset(args.splits_dir / "train.csv", img_root,
-                                tx_full_train, tx_face_train)
-    val_ds   = TwoStreamDataset(args.splits_dir / "val.csv", img_root,
-                                tx_full_eval, tx_face_eval)
+
+    if args.three_stream:
+        tx_hand_train = build_hand_train_transform(
+            mean, std, size=args.hand_size,
+            top_frac=args.hand_top_frac, bottom_frac=args.hand_bottom_frac,
+            left_frac=args.hand_left_frac, right_frac=args.hand_right_frac,
+        )
+        tx_hand_eval = build_hand_eval_transform(
+            mean, std, size=args.hand_size,
+            top_frac=args.hand_top_frac, bottom_frac=args.hand_bottom_frac,
+            left_frac=args.hand_left_frac, right_frac=args.hand_right_frac,
+        )
+        pose_lookup = load_pose_lookup(args.pose_parquet)
+        train_ds = ThreeStreamDataset(args.splits_dir / "train.csv", img_root,
+                                      tx_full_train, tx_hand_train, pose_lookup)
+        val_ds   = ThreeStreamDataset(args.splits_dir / "val.csv", img_root,
+                                      tx_full_eval, tx_hand_eval, pose_lookup)
+    else:
+        tx_face_train = build_face_train_transform(mean, std, size=args.face_size,
+                                                   top_frac=args.top_frac)
+        tx_face_eval  = build_face_eval_transform(mean, std, size=args.face_size,
+                                                  top_frac=args.top_frac)
+        train_ds = TwoStreamDataset(args.splits_dir / "train.csv", img_root,
+                                    tx_full_train, tx_face_train)
+        val_ds   = TwoStreamDataset(args.splits_dir / "val.csv", img_root,
+                                    tx_full_eval, tx_face_eval)
 
     loader_kwargs = dict(
         num_workers=args.num_workers,
@@ -194,7 +278,11 @@ def main() -> None:
                               **loader_kwargs)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = build_twostream(num_classes=10, use_cbam=not args.no_cbam).to(device)
+    if args.three_stream:
+        model = build_threestream(num_classes=10, use_cbam=not args.no_cbam,
+                                  pose_dim=POSE_DIM).to(device)
+    else:
+        model = build_twostream(num_classes=10, use_cbam=not args.no_cbam).to(device)
     if args.data_parallel and torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
@@ -240,19 +328,37 @@ def main() -> None:
             history = [h for h in history if h["epoch"] < start_epoch]
         print(f"Resumed from {args.resume} at epoch {start_epoch} "
               f"(best_val_acc={best_val_acc:.4f})")
-    print(f"Two-stream training {args.epochs} epochs | full={args.full_size} "
-          f"face={args.face_size} top_frac={args.top_frac} | batch={args.batch_size} | "
-          f"cutmix=({args.cutmix_p},{args.cutmix_alpha}) | device={device} | "
-          f"gpus={torch.cuda.device_count()}")
+    if args.three_stream:
+        print(f"Three-stream training {args.epochs} epochs | full={args.full_size} "
+              f"hand={args.hand_size} (top={args.hand_top_frac},bottom={args.hand_bottom_frac},"
+              f"left={args.hand_left_frac},right={args.hand_right_frac}) | "
+              f"pose_dim={POSE_DIM} | batch={args.batch_size} | cutmix=disabled | "
+              f"device={device} | gpus={torch.cuda.device_count()}")
+    else:
+        print(f"Two-stream training {args.epochs} epochs | full={args.full_size} "
+              f"face={args.face_size} top_frac={args.top_frac} | batch={args.batch_size} | "
+              f"cutmix=({args.cutmix_p},{args.cutmix_alpha}) | device={device} | "
+              f"gpus={torch.cuda.device_count()}")
 
     t_start = time.time()
     for epoch in range(start_epoch, args.epochs + 1):
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, criterion, device, ema,
-            use_cutmix=use_cutmix, cutmix_alpha=args.cutmix_alpha, cutmix_p=args.cutmix_p,
-        )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
-        ema_val_loss, ema_val_acc = evaluate(ema.shadow.to(device), val_loader, criterion, device)
+        if args.three_stream:
+            train_loss, train_acc = train_one_epoch_three(
+                model, train_loader, optimizer, scheduler, criterion, device, ema,
+            )
+            val_loss, val_acc = evaluate_three(model, val_loader, criterion, device)
+            ema_val_loss, ema_val_acc = evaluate_three(
+                ema.shadow.to(device), val_loader, criterion, device,
+            )
+        else:
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, optimizer, scheduler, criterion, device, ema,
+                use_cutmix=use_cutmix, cutmix_alpha=args.cutmix_alpha, cutmix_p=args.cutmix_p,
+            )
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            ema_val_loss, ema_val_acc = evaluate(
+                ema.shadow.to(device), val_loader, criterion, device,
+            )
 
         elapsed = (time.time() - t_start) / 60.0
         print(f"[ep {epoch:02d}/{args.epochs}] "

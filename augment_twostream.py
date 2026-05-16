@@ -21,6 +21,8 @@ from torchvision import transforms
 
 from augment import CLASS_TO_IDX
 
+POSE_DIM = 8
+
 
 class TopCrop:
     """Crop the top `frac` of a PIL image. Used as the face-stream input.
@@ -30,7 +32,7 @@ class TopCrop:
     top crop captures the head/gaze area without needing a face detector.
     """
 
-    def __init__(self, frac: float = 0.45):
+    def __init__(self, frac: float = 0.50):
         if not 0.0 < frac <= 1.0:
             raise ValueError(f"frac must be in (0, 1], got {frac}")
         self.frac = frac
@@ -41,6 +43,35 @@ class TopCrop:
 
     def __repr__(self) -> str:
         return f"TopCrop(frac={self.frac})"
+
+
+class RegionCrop:
+    """Generic rectangular crop in normalised coordinates.
+
+    Used for the Run 8 hand/lap stream: bottom-center region of the
+    cabin where phone/cup/radio interactions live. Static crop because
+    State Farm dashcam is fixed-mount.
+    """
+
+    def __init__(self, top_frac: float = 0.0, bottom_frac: float = 1.0,
+                 left_frac: float = 0.0, right_frac: float = 1.0):
+        if not (0.0 <= top_frac < bottom_frac <= 1.0):
+            raise ValueError(f"bad vertical: top={top_frac}, bottom={bottom_frac}")
+        if not (0.0 <= left_frac < right_frac <= 1.0):
+            raise ValueError(f"bad horizontal: left={left_frac}, right={right_frac}")
+        self.top, self.bottom = top_frac, bottom_frac
+        self.left, self.right = left_frac, right_frac
+
+    def __call__(self, img: Image.Image) -> Image.Image:
+        w, h = img.size
+        return img.crop((
+            int(w * self.left), int(h * self.top),
+            int(w * self.right), int(h * self.bottom),
+        ))
+
+    def __repr__(self) -> str:
+        return (f"RegionCrop(top={self.top}, bottom={self.bottom}, "
+                f"left={self.left}, right={self.right})")
 
 
 def build_full_train_transform(mean, std, size: int = 384) -> transforms.Compose:
@@ -55,7 +86,7 @@ def build_full_train_transform(mean, std, size: int = 384) -> transforms.Compose
 
 
 def build_face_train_transform(mean, std, size: int = 224,
-                               top_frac: float = 0.45) -> transforms.Compose:
+                               top_frac: float = 0.50) -> transforms.Compose:
     """Top-crop the head region, then run lighter aug at smaller resolution.
 
     Smaller size (224 default) because the cropped region is already
@@ -82,13 +113,69 @@ def build_full_eval_transform(mean, std, size: int = 384) -> transforms.Compose:
 
 
 def build_face_eval_transform(mean, std, size: int = 224,
-                              top_frac: float = 0.45) -> transforms.Compose:
+                              top_frac: float = 0.50) -> transforms.Compose:
     return transforms.Compose([
         TopCrop(frac=top_frac),
         transforms.Resize((size, size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=mean, std=std),
     ])
+
+
+# --- Run 8 hand-stream transforms ------------------------------------------
+
+def build_hand_train_transform(mean, std, size: int = 224,
+                               top_frac: float = 0.45,
+                               bottom_frac: float = 1.0,
+                               left_frac: float = 0.20,
+                               right_frac: float = 0.85) -> transforms.Compose:
+    """Crop driver's lap + lower wheel region, then standard aug.
+
+    Defaults: bottom 55% (top=0.45..bottom=1.0), center 65% width
+    (left=0.20..right=0.85). Cuts dashboard above wheel and right-side
+    passenger window glare. Captures phone-in-hand (c3, c4), radio
+    (c5), drink (c6), and the "empty" lap region defining c0/c9.
+    """
+    return transforms.Compose([
+        RegionCrop(top_frac=top_frac, bottom_frac=bottom_frac,
+                   left_frac=left_frac, right_frac=right_frac),
+        transforms.RandomResizedCrop(size, scale=(0.85, 1.0), ratio=(0.9, 1.1)),
+        transforms.TrivialAugmentWide(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+        transforms.RandomErasing(p=0.15, scale=(0.02, 0.06), ratio=(0.3, 3.3), value="random"),
+    ])
+
+
+def build_hand_eval_transform(mean, std, size: int = 224,
+                              top_frac: float = 0.45,
+                              bottom_frac: float = 1.0,
+                              left_frac: float = 0.20,
+                              right_frac: float = 0.85) -> transforms.Compose:
+    return transforms.Compose([
+        RegionCrop(top_frac=top_frac, bottom_frac=bottom_frac,
+                   left_frac=left_frac, right_frac=right_frac),
+        transforms.Resize((size, size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=mean, std=std),
+    ])
+
+
+# --- Run 8 pose lookup -----------------------------------------------------
+
+def load_pose_lookup(parquet_path: Path) -> dict[str, "np.ndarray"]:
+    """Load filename -> 8-d pose vector dict from precomputed parquet.
+
+    Missing filenames at lookup time get zero-imputed (gating bit p7=0
+    in zeroed vector → model learns "pose unavailable").
+    """
+    import numpy as np
+    import polars as pl
+    df = pl.read_parquet(parquet_path)
+    cols = [f"p{i}" for i in range(POSE_DIM)]
+    arr = df.select(cols).to_numpy().astype("float32")
+    names = df["filename"].to_list()
+    return {n: arr[i] for i, n in enumerate(names)}
 
 
 class TwoStreamDataset(Dataset):
@@ -114,6 +201,41 @@ class TwoStreamDataset(Dataset):
             full = self.tx_full(img)
             face = self.tx_face(img)
         return full, face, CLASS_TO_IDX[row["classname"]]
+
+
+class ThreeStreamDataset(Dataset):
+    """Returns (full_tensor, hand_tensor, pose_vec, label) per item.
+
+    Pose vector is looked up from a precomputed dict by image filename.
+    Missing entries are zero-imputed (gating bit p7=0 by construction).
+    """
+
+    def __init__(self, csv_path: Path, img_root: Path,
+                 full_transform: transforms.Compose,
+                 hand_transform: transforms.Compose,
+                 pose_lookup: dict[str, "np.ndarray"]):
+        import numpy as np
+        import pandas as pd
+        self.df = pd.read_csv(csv_path).reset_index(drop=True)
+        self.img_root = Path(img_root)
+        self.tx_full = full_transform
+        self.tx_hand = hand_transform
+        self.pose_lookup = pose_lookup
+        self._zero_pose = np.zeros(POSE_DIM, dtype="float32")
+
+    def __len__(self) -> int:
+        return len(self.df)
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        path = self.img_root / row["classname"] / row["img"]
+        with Image.open(path) as im:
+            img = im.convert("RGB")
+            full = self.tx_full(img)
+            hand = self.tx_hand(img)
+        pose_np = self.pose_lookup.get(row["img"], self._zero_pose)
+        pose = torch.from_numpy(pose_np.copy())
+        return full, hand, pose, CLASS_TO_IDX[row["classname"]]
 
 
 def cutmix_twostream(

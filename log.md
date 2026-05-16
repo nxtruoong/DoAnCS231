@@ -620,3 +620,140 @@ this dataset (no object cue, just pose).
 
 Recommend **D** for the project deadline, **A** if time allows one more
 ~2.3 hr GPU run.
+
+---
+
+## Run 7 — Two-stream (full + top-crop face) + CBAM, 60 epochs
+
+**Config:** `--epochs 60 --batch-size 64 --lr 0.03 --warmup-epochs 2
+--ema-decay 0.99 --cutmix-alpha 0.5 --cutmix-p 0.20 --full-size 384
+--face-size 224 --top-frac 0.5 --label-smoothing 0.1
+--early-stop-patience 8 --early-stop-min-delta 0.000 --ckpt-every 5
+--data-parallel` (commit `25b3de8`, 2x T4)
+
+**Architecture:** TwoStreamCBAM = two independent ResNet18+CBAM
+backbones (full image at 384, top-50% crop at 224) → concat 512+512 →
+MLP(256) → 10. Cutmix applied with shared permutation + per-stream box
+geometry. Trained from scratch.
+
+**Result (key epochs, crashed at ep 49/60 mid-batch with host-RAM OOM):**
+
+| ep | train loss | train acc | val loss | val acc | ema val acc |
+|----|-----------|-----------|----------|---------|-------------|
+| 10 | 0.8684 | 0.8809 | 1.9967 | 0.3362 | 0.5029 |
+| 20 | 0.7715 | 0.8934 | 1.3814 | 0.6448 | 0.6395 |
+| 30 | 0.6819 | 0.9345 | 1.5158 | 0.5652 | 0.6835 |
+| 35 | 0.6541 | 0.9462 | 1.0644 | 0.7827 | 0.6793 |
+| **42** | 0.6370 | 0.9550 | 1.0099 | **0.8240** ← best raw | 0.7509 |
+| 45 | 0.6162 | 0.9564 | 1.1035 | 0.7602 | 0.7480 |
+| **47** | 0.6479 | 0.9498 | 1.1509 | 0.7339 | **0.8017** ← best EMA |
+| 49 | 0.6192 | 0.9558 | 1.1312 | 0.7473 | 0.7721 |
+
+**Best raw val acc:** 0.8240 (ep 42). **Best EMA val acc:** 0.8017 (ep 47).
+Run died mid-ep-49 with `SIGKILL` from Kaggle's host-RAM oom-killer;
+recovered via resume from `ckpt_e45.pt` after memory-diet edits (commit
+`3fe25e8`: `persistent_workers=True`, `prefetch_factor=2`, smaller
+`batch=48`, `num_workers=2`).
+
+### Per-class result (eval on `best.pt`, EMA weights, val split)
+
+| class | precision | recall | F1 | support | vs Run 6 |
+|---|---:|---:|---:|---:|---|
+| c0 safe driving | 0.79 | **0.38** | 0.51 | 465 | ↓↓ recall crashed |
+| c1 text right | 0.99 | 0.89 | 0.94 | 462 | ≈ |
+| c2 phone right | 0.93 | 0.99 | 0.96 | 462 | ↑ |
+| c3 text left | **0.38** | **0.99** | 0.55 | 461 | ↓↓ became dumping ground |
+| c4 phone left | 0.98 | 0.88 | 0.93 | 472 | ≈ |
+| c5 radio | 1.00 | 0.52 | 0.69 | 466 | ↓ recall crashed |
+| c6 drinking | 0.98 | 0.90 | 0.94 | 468 | ≈ |
+| c7 reach behind | 0.80 | **0.98** | 0.88 | 423 | ↓ precision dropped |
+| c8 hair/makeup | 0.63 | 0.67 | 0.65 | 398 | ≈ |
+| c9 talk passenger | 0.88 | **0.29** | 0.44 | 447 | ↓↓ recall crashed |
+| **accuracy** | | | **0.751** | 4524 | -12pp vs Run 6 EMA |
+| **macro F1** | | | 0.748 | | -12pp |
+| **weighted F1** | | | 0.750 | | -12pp |
+
+### What went wrong
+
+Big regression vs Run 6 (0.875 → 0.751). Two-stream architecture
+underperformed single-stream despite +2x parameters. Per-class breakdown
+shows a bipolar failure mode:
+
+- **Dumping classes** (c3 R=0.99, c7 R=0.98): model predicts these for
+  anything ambiguous → precision craters (c3 P=0.38).
+- **Starving classes** (c0 R=0.38, c5 R=0.52, c9 R=0.29): model rarely
+  predicts these even when correct → recall craters.
+
+c0, c9, c3 all share visual structure: hands on/near wheel, no large
+object in frame. Discriminator = subtle head pose (c9 looks right) +
+small phone in left hand (c3) + nothing (c0). c5 (radio) lost to c7
+(reach-behind) — both = right-arm extension.
+
+### Root cause
+
+Three hypotheses, ranked by likelihood.
+
+**1. Face-stream crop is too generous (most likely).** `top_frac=0.5`
+keeps the top half of the frame — that includes the head **and** the
+upper torso/shoulders. The "face stream" was effectively learning the
+same coarse posture cues the full stream already had, with worse
+resolution (224 vs 384). It added parameters without adding signal.
+The fusion head got two redundant 512-d vectors, doubling overfit
+capacity on driver-specific cues while contributing nothing new on the
+discriminative classes (c0/c9 needed precise gaze; c3 needed small
+distant object).
+
+**2. CutMix on c0 = label noise.** c0 (safe driving) is defined as
+*absence* of distractor. Pasting a random patch from another class
+into a c0 image adds a distractor → trains the model that c0 sometimes
+contains distractors → blurs the c0 decision boundary → leaks
+predictions to whichever active class the patch came from (c3 wins
+because c3 is the densest "hand near steering" class). Same logic
+applies for c9 (also passive, hand-on-wheel).
+
+**3. Checkpoint selection bug.** `best.pt` is saved on
+`max(val_acc, ema_val_acc)`. When raw val peaks (ep 42, 0.8240) but EMA
+at that epoch is still lagging (0.7509), `best.pt` holds the **raw**
+weights chosen by raw val *while also storing the lagging EMA*. Eval
+defaults to `--use-ema` → loads the lagging EMA at ep 42, reports 0.75.
+Eval would show ≈0.80 if `best.pt` selected purely on EMA. Bug
+contributes ~3pp to the regression. Real performance gap vs Run 6 is
+~9pp, not 12pp — still a regression.
+
+### What might have masked the regression in training-log numbers
+
+Training-log EMA val acc 0.8017 (ep 47) looked roughly competitive
+with Run 6's 0.8747 (only -7pp), so the architecture seemed merely
+weaker, not broken. The per-class eval exposed the real shape: model
+collapsed onto a 4-class detector (c1/c2/c4/c6) plus two dumping
+classes — eval-time accuracy averaged a near-perfect head with a
+near-random tail.
+
+### Decision: pursue Run 8 with architecture change
+
+Two-stream face crop was the wrong inductive bias for this dataset.
+The discriminative information for the passive classes (c0/c9/c3)
+lives in:
+
+- **Lap and lower-wheel region** (phone in hand for c3, no object for
+  c0). Top-half crop **explicitly removes** this region.
+- **Head yaw/gaze** (c9 looks right at passenger). Top-50% crop
+  captures the head but doesn't *isolate* it — model has to find it
+  inside a 224×224 crop that also contains shoulders/seat.
+
+Run 8 replaces face stream with **hand/lap stream** (bottom-center
+crop) and injects **MediaPipe head-pose scalars** for explicit gaze
+signal. Drops CutMix entirely (label-noise hypothesis above).
+
+Full plan: `RUN8_PLAN.md`.
+
+### Aux finding: memory budget
+
+Original Run 7 config (`batch=64`, `num_workers=4`, DataParallel,
+default `prefetch_factor=2`) consumed ~14 GB host RAM by ep 49 on the
+Kaggle 13-GB-RAM notebook → SIGKILL. Memory-diet edits in commit
+`3fe25e8` (`persistent_workers=True`, `prefetch_factor=2` explicit,
+optional `--resume`) plus runtime flags (`batch=48`, `num_workers=2`,
+drop `--data-parallel`) brought peak host RAM to ~9 GB. Resume from
+`ckpt_e45.pt` recovered the run with zero metric loss. Apply same
+config to Run 8.
