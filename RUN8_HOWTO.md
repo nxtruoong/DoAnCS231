@@ -200,6 +200,21 @@ be high). If OOM → drop `--batch-size` to 32 or remove
 
 ---
 
+## 5b. Restart kernel before training (recommended)
+
+Cell 2 loaded MediaPipe (~200 MB model). Cell 5 spun up a smoke train
+process. Both leave residue in the kernel that competes with training
+for the 13 GB Kaggle host RAM cap.
+
+**Restart the kernel now**, then re-run Cell 1a only. Skip Cells 1b /
+1c / 2 (their outputs are already on disk). Re-run Cell 3 / 4 only if
+you want to re-verify crops/pose. Go straight to Cell 6.
+
+This is the same precaution that turned Run 7's crash-prone setup into
+a stable one — peak host RAM matters, not average.
+
+---
+
 ## 6. Full Run 8 training (Cell 6, ~3-3.5 hr)
 
 ```python
@@ -462,7 +477,8 @@ roughly 1 MB extra. Use LFS or split-zip for Spaces upload.
 | `--three-stream requires --pose-parquet PATH` | flag missing | add `--pose-parquet /kaggle/working/splits/pose.parquet` |
 | `mediapipe: not found` | install missing | `!pip install -q mediapipe` |
 | Pose detection rate < 60% | cabin lighting / occlusion | lower `min_detection_confidence` in `extract_pose.py`, or fall back to YOLOv8n-face |
-| OOM at batch 48 | host RAM, not VRAM | drop `--num-workers 2 → 0`, `--batch-size 48 → 32` |
+| OOM at batch 48 | host RAM, not VRAM | Tier B: drop `--data-parallel` (single T4, +70% wall). Tier C: also `--num-workers 0 --batch-size 32` |
+| Host RAM creeps over 10 GB by ep 3 | DataParallel + worker queue churn | kill, restart kernel, relaunch without `--data-parallel` |
 | Per-epoch time > 5 min | DataLoader bottleneck | check `--num-workers 4`, `--batch-size 64`; verify `pose.parquet` is on local SSD (`/kaggle/working`), not `/kaggle/input` |
 | Val acc stuck < 0.50 by ep 15 | pose-MLP init / fusion-head LR | inspect `ckpt_e10.pt`; check `args_dict["three_stream"]==True` |
 | `Three-stream checkpoint requires --pose-parquet` at eval | eval invoked without pose | pass `--pose-parquet PATH` to `eval_twostream.py` |
